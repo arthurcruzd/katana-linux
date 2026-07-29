@@ -1,41 +1,49 @@
 #!/usr/bin/env python3
 """Katana Gen 3 BLE-MIDI client (BlueZ D-Bus, bonded).
 
-Requires the BT-DUAL already paired/bonded (once). Then:
-  connect -> StartNotify -> RQ1/DT1 SysEx over BLE-MIDI framing.
+  .venv/bin/python katana_ble.py status
+  .venv/bin/python katana_ble.py dump
+  .venv/bin/python katana_ble.py save presets/foo.json
+  .venv/bin/python katana_ble.py load presets/foo.json
+  .venv/bin/python katana_ble.py set amp.gain 80
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
-from typing import Callable
+from pathlib import Path
+from typing import Any, Callable
 
 from dbus_fast import BusType, Message, MessageType, Variant
 from dbus_fast.aio import MessageBus
 
 ADDR_DEFAULT = "E7:47:8F:03:0D:C4"
 DEVICE_ID = 0x10
-MODEL_ID = bytes([0x01, 0x05, 0x07])  # product_setting.js modelId '010507'
+MODEL_ID = bytes([0x01, 0x05, 0x07])
 
-# temp-patch AMP block (logical addresses as on the wire after BTS nibble/_7bitize)
-ADDR_SETUP_PATCH = 0x00000000
-ADDR_PATCH_COM = 0x20000000
-ADDR_PATCH_AMP = 0x20000600
-ADDR_PATCH_SW = 0x20000800
+# temp-patch logical addresses (on-wire after BTS nibble/_7bitize round-trip)
+ADDR = {
+    "com": 0x20000000,       # name (16 ascii)
+    "amp": 0x20000600,       # 10 bytes
+    "sw": 0x20000800,        # booster/mod/fx/delay/delay2/reverb switches
+    "booster": 0x20000A00,   # booster var 1
+    "delay": 0x20002800,     # delay var 1
+    "reverb": 0x20003400,    # reverb var 1
+}
+
+AMP_TYPE = ["acoustic", "clean", "pushed", "crunch", "lead", "brown"]
+DELAY_TYPE = [
+    "digital", "pan", "stereo", "analog", "tape_echo", "reverse", "modulate", "sde3000"
+]
+REVERB_TYPE = ["plate", "room", "hall", "spring", "modulate"]
 
 AMP_FIELDS = [
-    ("gain", 0),
-    ("volume", 1),
-    ("bass", 2),
-    ("middle", 3),
-    ("treble", 4),
-    ("presence", 5),
-    ("poweramp_variation", 6),
-    ("type", 7),
-    ("resonance", 8),
-    ("preamp_variation", 9),
+    "gain", "volume", "bass", "middle", "treble", "presence",
+    "poweramp_variation", "type", "resonance", "preamp_variation",
 ]
+SW_FIELDS = ["booster", "mod", "fx", "delay", "delay2", "reverb"]
 
 
 def a4(v: int) -> list[int]:
@@ -56,12 +64,19 @@ def dt1(addr: int, data: list[int]) -> bytes:
     return bytes([0xF0, 0x41, DEVICE_ID, *MODEL_ID, 0x12, *body, checksum(body), 0xF7])
 
 
+def enc_4x4(v: int) -> list[int]:
+    v = max(0, min(0xFFFF, int(v)))
+    return [(v >> 12) & 0xF, (v >> 8) & 0xF, (v >> 4) & 0xF, v & 0xF]
+
+
+def dec_4x4(b: list[int]) -> int:
+    return ((b[0] & 0xF) << 12) | ((b[1] & 0xF) << 8) | ((b[2] & 0xF) << 4) | (b[3] & 0xF)
+
+
 def ble_wrap(sysex: bytes, mtu: int = 20) -> list[bytes]:
-    """BLE-MIDI framing: header 0x80, timestamp 0x80 before status and F7."""
     out: list[bytes] = []
     data = list(sysex)
     first = True
-    # keep packets comfortably under ATT default
     chunk = max(mtu - 4, 12)
     while data:
         part, data = data[:chunk], data[chunk:]
@@ -70,9 +85,7 @@ def ble_wrap(sysex: bytes, mtu: int = 20) -> list[bytes]:
             pkt.append(0x80)
             first = False
         if not data and part and part[-1] == 0xF7:
-            pkt.extend(part[:-1])
-            pkt.append(0x80)
-            pkt.append(0xF7)
+            pkt.extend(part[:-1] + [0x80, 0xF7])
         else:
             pkt.extend(part)
         out.append(bytes(pkt))
@@ -90,25 +103,20 @@ def ble_unwrap_feed(state: bytearray, pkt: bytes, on_sysex: Callable[[bytes], No
                 on_sysex(bytes(state))
                 state.clear()
         elif b & 0x80:
-            continue  # timestamp
+            continue
         elif state:
             state.append(b)
 
 
 def parse_dt1(msg: bytes) -> tuple[int, list[int]] | None:
-    """Return (addr, data) for Roland DT1, or None."""
     if len(msg) < 15 or msg[0] != 0xF0 or msg[1] != 0x41 or msg[-1] != 0xF7:
         return None
-    # F0 41 dev model(3) 12 addr(4) data... ck F7
     if msg[2] not in (DEVICE_ID, 0x7F):
         return None
-    if bytes(msg[3:6]) != MODEL_ID:
-        return None
-    if msg[6] != 0x12:
+    if bytes(msg[3:6]) != MODEL_ID or msg[6] != 0x12:
         return None
     addr = (msg[7] << 24) | (msg[8] << 16) | (msg[9] << 8) | msg[10]
-    data = list(msg[11:-2])
-    return addr, data
+    return addr, list(msg[11:-2])
 
 
 class KatanaBLE:
@@ -119,7 +127,6 @@ class KatanaBLE:
         self.io_path: str | None = None
         self._buf = bytearray()
         self.sysex: list[bytes] = []
-        self._waiters: list[asyncio.Future] = []
 
     async def _call(self, path, iface, member, sig="", body=None, dest="org.bluez"):
         assert self.bus
@@ -139,27 +146,18 @@ class KatanaBLE:
 
     async def connect(self) -> None:
         self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-        # connect if needed
         try:
             props = await self._call(
-                self.dev,
-                "org.freedesktop.DBus.Properties",
-                "Get",
-                "ss",
+                self.dev, "org.freedesktop.DBus.Properties", "Get", "ss",
                 ["org.bluez.Device1", "Connected"],
             )
             if not props[0].value:
                 await self._call(self.dev, "org.bluez.Device1", "Connect")
                 await asyncio.sleep(1.5)
-        except RuntimeError as e:
-            # try connect anyway
-            try:
-                await self._call(self.dev, "org.bluez.Device1", "Connect")
-                await asyncio.sleep(1.5)
-            except RuntimeError:
-                raise e from None
+        except RuntimeError:
+            await self._call(self.dev, "org.bluez.Device1", "Connect")
+            await asyncio.sleep(1.5)
 
-        # resolve IO characteristic (...6bf3)
         for _ in range(30):
             objs = await self._call(
                 "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"
@@ -178,13 +176,10 @@ class KatanaBLE:
                 break
             await asyncio.sleep(0.3)
         if not self.io_path:
-            raise RuntimeError("BLE-MIDI characteristic not found (is amp in MIDI mode?)")
+            raise RuntimeError("BLE-MIDI char not found (MIDI mode? bonded?)")
 
         await self._call(
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "AddMatch",
-            "s",
+            "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s",
             [
                 "type='signal',interface='org.freedesktop.DBus.Properties',"
                 f"member='PropertiesChanged',path='{self.io_path}'"
@@ -202,14 +197,12 @@ class KatanaBLE:
 
             def on_sysex(s: bytes) -> None:
                 self.sysex.append(s)
-                for fut in list(self._waiters):
-                    if not fut.done():
-                        fut.set_result(s)
 
             ble_unwrap_feed(self._buf, raw, on_sysex)
 
         self.bus.add_message_handler(handler)
         await self._call(self.io_path, "org.bluez.GattCharacteristic1", "StartNotify")
+        await asyncio.sleep(0.3)
 
     async def disconnect(self) -> None:
         if self.io_path and self.bus:
@@ -224,86 +217,219 @@ class KatanaBLE:
         assert self.io_path
         for pkt in ble_wrap(msg):
             await self._call(
-                self.io_path,
-                "org.bluez.GattCharacteristic1",
-                "WriteValue",
+                self.io_path, "org.bluez.GattCharacteristic1", "WriteValue",
                 "aya{sv}",
                 [bytes(pkt), {"type": Variant("s", "command")}],
             )
             await asyncio.sleep(0.03)
 
-    async def request(self, addr: int, size: int, timeout: float = 3.0) -> list[int]:
-        """RQ1 and return DT1 data bytes."""
-        loop = asyncio.get_event_loop()
-        fut: asyncio.Future = loop.create_future()
-        self._waiters.append(fut)
-        try:
-            await self.send_sysex(rq1(addr, size))
-            msg = await asyncio.wait_for(fut, timeout=timeout)
-        finally:
-            if fut in self._waiters:
-                self._waiters.remove(fut)
-        parsed = parse_dt1(msg)
-        if not parsed:
-            # may have gotten identity etc; wait for matching addr
-            deadline = loop.time() + timeout
-            while loop.time() < deadline:
-                for s in reversed(self.sysex):
-                    p = parse_dt1(s)
-                    if p and p[0] == addr:
-                        return p[1]
-                await asyncio.sleep(0.1)
-            raise TimeoutError(f"no DT1 for addr {addr:#010x}, last={msg.hex(' ')}")
-        if parsed[0] != addr:
-            # search buffer
-            for s in reversed(self.sysex):
+    async def request(self, addr: int, size: int, timeout: float = 3.5) -> list[int]:
+        before = len(self.sysex)
+        await self.send_sysex(rq1(addr, size))
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            for s in self.sysex[before:]:
                 p = parse_dt1(s)
                 if p and p[0] == addr:
                     return p[1]
-        return parsed[1]
+            await asyncio.sleep(0.05)
+        raise TimeoutError(f"no DT1 for {addr:#010x}")
 
-    async def write(self, addr: int, data: list[int]) -> None:
-        await self.send_sysex(dt1(addr, data))
+    async def write_bytes(self, addr: int, data: list[int]) -> None:
+        # chunk large payloads to stay under SYSEX_MAXLEN-ish ATT limits
+        off = 0
+        while off < len(data):
+            chunk = data[off: off + 40]
+            await self.send_sysex(dt1(addr + off, chunk))
+            await asyncio.sleep(0.08)
+            off += len(chunk)
 
     async def identity(self) -> bytes | None:
         before = len(self.sysex)
         await self.send_sysex(bytes([0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7]))
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.2)
         for s in self.sysex[before:]:
             if len(s) > 5 and s[1] == 0x7E and s[3] == 0x06 and s[4] == 0x02:
                 return s
         return None
 
+    async def read_patch(self) -> dict[str, Any]:
+        name_raw = await self.request(ADDR["com"], 0x10)
+        name = bytes(b for b in name_raw if 32 <= b < 127).decode("ascii", "replace").rstrip()
+        amp = await self.request(ADDR["amp"], 0x0A)
+        sw = await self.request(ADDR["sw"], 0x06)
+        dly = await self.request(ADDR["delay"], 0x11)
+        rev = await self.request(ADDR["reverb"], 0x0D)
+
+        amp_d = {f: amp[i] for i, f in enumerate(AMP_FIELDS)}
+        amp_d["type_name"] = AMP_TYPE[amp_d["type"]] if amp_d["type"] < len(AMP_TYPE) else str(amp_d["type"])
+
+        delay_time = dec_4x4(dly[1:5])
+        rev_pre = dec_4x4(rev[3:7])
+
+        return {
+            "name": name,
+            "name_raw": name_raw,
+            "amp": amp_d,
+            "sw": {f: sw[i] for i, f in enumerate(SW_FIELDS)},
+            "delay": {
+                "type": dly[0],
+                "type_name": DELAY_TYPE[dly[0]] if dly[0] < len(DELAY_TYPE) else str(dly[0]),
+                "time_ms": delay_time,
+                "feedback": dly[5],
+                "high_cut": dly[6],
+                "effect_level": dly[7],
+                "direct_level": dly[8],
+                "raw": dly,
+            },
+            "reverb": {
+                "type": rev[0],
+                "type_name": REVERB_TYPE[rev[0]] if rev[0] < len(REVERB_TYPE) else str(rev[0]),
+                "layer_mode": rev[1],
+                "time": rev[2],
+                "pre_delay_ms": rev_pre,
+                "low_cut": rev[7],
+                "high_cut": rev[8],
+                "density": rev[9],
+                "effect_level": rev[10],
+                "direct_level": rev[11],
+                "spring_color": rev[12] if len(rev) > 12 else 0,
+                "raw": rev,
+            },
+        }
+
+    async def apply_preset(self, preset: dict[str, Any]) -> None:
+        """Write a preset dict (same shape as read_patch / JSON files)."""
+        name = (preset.get("name") or "PRESET")[:16].ljust(16)
+        await self.write_bytes(ADDR["com"], [ord(c) & 0x7F for c in name])
+
+        amp = preset["amp"]
+        amp_bytes = [int(amp[f]) & 0x7F for f in AMP_FIELDS]
+        await self.write_bytes(ADDR["amp"], amp_bytes)
+
+        sw = preset.get("sw") or {}
+        sw_bytes = [int(sw.get(f, 0)) & 0x7F for f in SW_FIELDS]
+        await self.write_bytes(ADDR["sw"], sw_bytes)
+
+        d = preset.get("delay") or {}
+        if "raw" in d and len(d["raw"]) >= 9:
+            dly = list(d["raw"])
+        else:
+            dly = [0] * 0x11
+            dly[0] = int(d.get("type", 0))
+            t = enc_4x4(int(d.get("time_ms", 400)))
+            dly[1:5] = t
+            dly[5] = int(d.get("feedback", 22))
+            dly[6] = int(d.get("high_cut", 10))
+            dly[7] = int(d.get("effect_level", 35))
+            dly[8] = int(d.get("direct_level", 100))
+            dly[9] = int(d.get("tap_time", 50))
+            dly[10] = int(d.get("mod_rate", 40))
+            dly[11] = int(d.get("mod_depth", 55))
+            dly[12] = int(d.get("lpf", 1))
+        await self.write_bytes(ADDR["delay"], dly)
+
+        r = preset.get("reverb") or {}
+        if "raw" in r and len(r["raw"]) >= 12:
+            rev = list(r["raw"])
+        else:
+            rev = [0] * 0x0D
+            rev[0] = int(r.get("type", 0))
+            rev[1] = int(r.get("layer_mode", 2))
+            rev[2] = int(r.get("time", 35))
+            rev[3:7] = enc_4x4(int(r.get("pre_delay_ms", 20)))
+            rev[7] = int(r.get("low_cut", 14))
+            rev[8] = int(r.get("high_cut", 8))
+            rev[9] = int(r.get("density", 8))
+            rev[10] = int(r.get("effect_level", 40))
+            rev[11] = int(r.get("direct_level", 100))
+            rev[12] = int(r.get("spring_color", 100))
+        await self.write_bytes(ADDR["reverb"], rev)
+        await asyncio.sleep(0.3)
+
+
+def print_patch(p: dict[str, Any]) -> None:
+    a = p["amp"]
+    print(f"name: {p['name']!r}")
+    print(
+        f"AMP  type={a['type_name']}({a['type']})  gain={a['gain']}  vol={a['volume']}  "
+        f"bass={a['bass']} mid={a['middle']} treble={a['treble']} "
+        f"presence={a['presence']} reso={a['resonance']}"
+    )
+    print(f"SW   {p['sw']}")
+    d = p["delay"]
+    print(
+        f"DLY  {d['type_name']}  {d['time_ms']}ms  fb={d['feedback']}  "
+        f"lvl={d['effect_level']}  dir={d['direct_level']}"
+    )
+    r = p["reverb"]
+    print(
+        f"REV  {r['type_name']}  time={r['time']}  pre={r['pre_delay_ms']}ms  "
+        f"lvl={r['effect_level']}  dir={r['direct_level']}"
+    )
+
 
 async def cmd_status(k: KatanaBLE) -> None:
     ident = await k.identity()
     print("identity:", ident.hex(" ") if ident else "(none)")
-    name_raw = await k.request(ADDR_PATCH_COM, 0x10)
-    name = bytes(b for b in name_raw if 32 <= b < 127).decode("ascii", errors="replace").strip()
-    print(f"patch name: {name!r}  raw={name_raw}")
-    amp = await k.request(ADDR_PATCH_AMP, 0x0A)
-    print("AMP:")
-    for field, off in AMP_FIELDS:
-        print(f"  {field:20} = {amp[off]}")
+    p = await k.read_patch()
+    print_patch(p)
 
 
-async def cmd_get(k: KatanaBLE, field: str) -> None:
-    amp = await k.request(ADDR_PATCH_AMP, 0x0A)
-    lookup = {n: i for n, i in AMP_FIELDS}
-    if field not in lookup:
-        raise SystemExit(f"unknown field {field}, choose from {list(lookup)}")
-    print(f"{field} = {amp[lookup[field]]}")
+async def cmd_dump(k: KatanaBLE) -> None:
+    p = await k.read_patch()
+    print(json.dumps(p, indent=2))
+
+
+async def cmd_save(k: KatanaBLE, path: Path) -> None:
+    p = await k.read_patch()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # drop bulky raw if we have structured fields; keep raw for fidelity
+    path.write_text(json.dumps(p, indent=2) + "\n")
+    print(f"saved {path}  ({p['name']!r})")
+
+
+async def cmd_load(k: KatanaBLE, path: Path) -> None:
+    preset = json.loads(path.read_text())
+    print(f"loading {path} -> {preset.get('name')!r}")
+    await k.apply_preset(preset)
+    p = await k.read_patch()
+    print("readback:")
+    print_patch(p)
 
 
 async def cmd_set(k: KatanaBLE, field: str, value: int) -> None:
-    lookup = {n: i for n, i in AMP_FIELDS}
-    if field not in lookup:
-        raise SystemExit(f"unknown field {field}, choose from {list(lookup)}")
-    off = lookup[field]
-    await k.write(ADDR_PATCH_AMP + off, [value & 0x7F])
-    await asyncio.sleep(0.3)
-    amp = await k.request(ADDR_PATCH_AMP, 0x0A)
-    print(f"set {field}={value} -> readback {amp[off]}")
+    if field.startswith("amp.") or field in AMP_FIELDS:
+        key = field.split(".", 1)[-1]
+        if key not in AMP_FIELDS:
+            raise SystemExit(f"amp fields: {AMP_FIELDS}")
+        off = AMP_FIELDS.index(key)
+        await k.write_bytes(ADDR["amp"] + off, [value & 0x7F])
+        await asyncio.sleep(0.25)
+        amp = await k.request(ADDR["amp"], 0x0A)
+        print(f"set amp.{key}={value} -> {amp[off]}")
+        return
+    if field.startswith("sw.") or field in SW_FIELDS:
+        key = field.split(".", 1)[-1]
+        off = SW_FIELDS.index(key)
+        await k.write_bytes(ADDR["sw"] + off, [value & 0x7F])
+        await asyncio.sleep(0.25)
+        sw = await k.request(ADDR["sw"], 0x06)
+        print(f"set sw.{key}={value} -> {sw[off]}")
+        return
+    raise SystemExit("use amp.<field> or sw.<field>")
+
+
+async def cmd_get(k: KatanaBLE, field: str) -> None:
+    p = await k.read_patch()
+    if field == "name":
+        print(p["name"])
+        return
+    if field.startswith("amp.") or field in AMP_FIELDS:
+        key = field.split(".", 1)[-1]
+        print(p["amp"][key])
+        return
+    raise SystemExit("unknown field")
 
 
 async def main() -> None:
@@ -311,11 +437,16 @@ async def main() -> None:
     ap.add_argument("--addr", default=ADDR_DEFAULT)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
-    g = sub.add_parser("get")
-    g.add_argument("field")
-    s = sub.add_parser("set")
-    s.add_argument("field")
-    s.add_argument("value", type=int)
+    sub.add_parser("dump")
+    p = sub.add_parser("save")
+    p.add_argument("path")
+    p = sub.add_parser("load")
+    p.add_argument("path")
+    p = sub.add_parser("get")
+    p.add_argument("field")
+    p = sub.add_parser("set")
+    p.add_argument("field")
+    p.add_argument("value", type=int)
     args = ap.parse_args()
 
     k = KatanaBLE(args.addr)
@@ -324,6 +455,12 @@ async def main() -> None:
     try:
         if args.cmd == "status":
             await cmd_status(k)
+        elif args.cmd == "dump":
+            await cmd_dump(k)
+        elif args.cmd == "save":
+            await cmd_save(k, Path(args.path))
+        elif args.cmd == "load":
+            await cmd_load(k, Path(args.path))
         elif args.cmd == "get":
             await cmd_get(k, args.field)
         elif args.cmd == "set":

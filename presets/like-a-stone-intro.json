@@ -1,0 +1,53 @@
+{
+  "name": "LikeAStone Intro",
+  "notes": "Audioslave — Like a Stone intro. Clean/warm arpeggios in Drop D. Low gain so notes bloom, plate reverb for room, short digital delay for depth. Dig in slightly on the chord changes.",
+  "song": "Audioslave - Like a Stone (intro)",
+  "tuning": "Drop D",
+  "amp": {
+    "gain": 28,
+    "volume": 55,
+    "bass": 58,
+    "middle": 55,
+    "treble": 48,
+    "presence": 42,
+    "poweramp_variation": 0,
+    "type": 1,
+    "type_name": "clean",
+    "resonance": 48,
+    "preamp_variation": 0
+  },
+  "sw": {
+    "booster": 0,
+    "mod": 0,
+    "fx": 0,
+    "delay": 1,
+    "delay2": 0,
+    "reverb": 1
+  },
+  "delay": {
+    "type": 0,
+    "type_name": "digital",
+    "time_ms": 420,
+    "feedback": 18,
+    "high_cut": 10,
+    "effect_level": 28,
+    "direct_level": 100,
+    "tap_time": 50,
+    "mod_rate": 40,
+    "mod_depth": 40,
+    "lpf": 1
+  },
+  "reverb": {
+    "type": 0,
+    "type_name": "plate",
+    "layer_mode": 2,
+    "time": 42,
+    "pre_delay_ms": 25,
+    "low_cut": 14,
+    "high_cut": 9,
+    "density": 8,
+    "effect_level": 38,
+    "direct_level": 100,
+    "spring_color": 100
+  }
+}
