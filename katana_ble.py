@@ -260,6 +260,7 @@ class KatanaBLE:
         sw = await self.request(ADDR["sw"], 0x06)
         dly = await self.request(ADDR["delay"], 0x11)
         rev = await self.request(ADDR["reverb"], 0x0D)
+        bst = await self.request(ADDR["booster"], 0x08)
 
         amp_d = {f: amp[i] for i, f in enumerate(AMP_FIELDS)}
         amp_d["type_name"] = AMP_TYPE[amp_d["type"]] if amp_d["type"] < len(AMP_TYPE) else str(amp_d["type"])
@@ -272,6 +273,17 @@ class KatanaBLE:
             "name_raw": name_raw,
             "amp": amp_d,
             "sw": {f: sw[i] for i, f in enumerate(SW_FIELDS)},
+            "booster": {
+                "type": bst[0],
+                "drive": bst[1],
+                "bottom": bst[2] - 50,
+                "tone": bst[3] - 50,
+                "solo_sw": bst[4],
+                "solo_level": bst[5],
+                "effect_level": bst[6],
+                "direct_mix": bst[7],
+                "raw": bst,
+            },
             "delay": {
                 "type": dly[0],
                 "type_name": DELAY_TYPE[dly[0]] if dly[0] < len(DELAY_TYPE) else str(dly[0]),
@@ -345,6 +357,24 @@ class KatanaBLE:
             rev[11] = int(r.get("direct_level", 100))
             rev[12] = int(r.get("spring_color", 100))
         await self.write_bytes(ADDR["reverb"], rev)
+
+        b = preset.get("booster")
+        if b:
+            if "raw" in b and len(b["raw"]) >= 8:
+                bst = list(b["raw"])
+            else:
+                # BOTTOM/TONE use ofs=50 in address_map (stored = value + 50)
+                bst = [0] * 8
+                bst[0] = int(b.get("type", 0))
+                bst[1] = int(b.get("drive", 50))
+                bst[2] = int(b.get("bottom", 0)) + 50
+                bst[3] = int(b.get("tone", 0)) + 50
+                bst[4] = int(b.get("solo_sw", 0))
+                bst[5] = int(b.get("solo_level", 50))
+                bst[6] = int(b.get("effect_level", 50))
+                bst[7] = int(b.get("direct_mix", 0))
+            await self.write_bytes(ADDR["booster"], bst)
+
         await asyncio.sleep(0.3)
 
 
@@ -357,6 +387,12 @@ def print_patch(p: dict[str, Any]) -> None:
         f"presence={a['presence']} reso={a['resonance']}"
     )
     print(f"SW   {p['sw']}")
+    if p.get("booster"):
+        b = p["booster"]
+        print(
+            f"BST  type={b['type']} drive={b['drive']} bottom={b['bottom']} "
+            f"tone={b['tone']} lvl={b['effect_level']}"
+        )
     d = p["delay"]
     print(
         f"DLY  {d['type_name']}  {d['time_ms']}ms  fb={d['feedback']}  "

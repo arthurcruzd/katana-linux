@@ -1,0 +1,64 @@
+{
+  "name": "MoP Main Riff",
+  "notes": "Metallica — Master of Puppets opening riff. Brown + T-Scream mid-push, tight lows, present mids for gallops. Delay/reverb off. Standard E (or Eb).",
+  "song": "Metallica - Master of Puppets (main riff)",
+  "tuning": "E standard (or Eb)",
+  "amp": {
+    "gain": 78,
+    "volume": 52,
+    "bass": 48,
+    "middle": 62,
+    "treble": 68,
+    "presence": 58,
+    "poweramp_variation": 1,
+    "type": 5,
+    "type_name": "brown",
+    "resonance": 42,
+    "preamp_variation": 1
+  },
+  "sw": {
+    "booster": 1,
+    "mod": 0,
+    "fx": 0,
+    "delay": 0,
+    "delay2": 0,
+    "reverb": 0
+  },
+  "booster": {
+    "type": 11,
+    "type_name": "t_scream",
+    "drive": 45,
+    "bottom": -10,
+    "tone": 5,
+    "solo_sw": 0,
+    "solo_level": 50,
+    "effect_level": 55,
+    "direct_mix": 0
+  },
+  "delay": {
+    "type": 0,
+    "type_name": "digital",
+    "time_ms": 400,
+    "feedback": 10,
+    "high_cut": 10,
+    "effect_level": 0,
+    "direct_level": 100,
+    "tap_time": 50,
+    "mod_rate": 40,
+    "mod_depth": 40,
+    "lpf": 1
+  },
+  "reverb": {
+    "type": 1,
+    "type_name": "room",
+    "layer_mode": 2,
+    "time": 12,
+    "pre_delay_ms": 5,
+    "low_cut": 14,
+    "high_cut": 10,
+    "density": 6,
+    "effect_level": 0,
+    "direct_level": 100,
+    "spring_color": 100
+  }
+}
