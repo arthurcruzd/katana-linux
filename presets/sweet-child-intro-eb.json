@@ -1,0 +1,71 @@
+{
+  "name": "SCOM Intro Eb",
+  "notes": "Guns N' Roses — Sweet Child O' Mine intro lead. Marshall-ish LEAD, singing delay/reverb. FX Pitch Shifter -1 st (play in E, sounds Eb). direct_mix=0 so the whole signal is transposed.",
+  "song": "Guns N' Roses - Sweet Child O' Mine (intro)",
+  "tuning": "Sounds Eb (pitch shifter -1). Play as if standard open shapes.",
+  "amp": {
+    "gain": 48,
+    "volume": 38,
+    "bass": 50,
+    "middle": 60,
+    "treble": 62,
+    "presence": 52,
+    "poweramp_variation": 0,
+    "type": 4,
+    "type_name": "lead",
+    "resonance": 48,
+    "preamp_variation": 1
+  },
+  "sw": {
+    "booster": 0,
+    "mod": 0,
+    "fx": 1,
+    "delay": 1,
+    "delay2": 0,
+    "reverb": 1
+  },
+  "fx": {
+    "type": 11,
+    "type_name": "pitch_shifter",
+    "pitch_semitones": -1,
+    "mode": 3,
+    "level": 100,
+    "direct_mix": 0
+  },
+  "booster": {
+    "type": 11,
+    "drive": 30,
+    "bottom": 0,
+    "tone": 0,
+    "solo_sw": 0,
+    "solo_level": 50,
+    "effect_level": 40,
+    "direct_mix": 0
+  },
+  "delay": {
+    "type": 0,
+    "type_name": "digital",
+    "time_ms": 380,
+    "feedback": 28,
+    "high_cut": 10,
+    "effect_level": 36,
+    "direct_level": 100,
+    "tap_time": 50,
+    "mod_rate": 40,
+    "mod_depth": 35,
+    "lpf": 1
+  },
+  "reverb": {
+    "type": 0,
+    "type_name": "plate",
+    "layer_mode": 2,
+    "time": 38,
+    "pre_delay_ms": 20,
+    "low_cut": 14,
+    "high_cut": 9,
+    "density": 8,
+    "effect_level": 32,
+    "direct_level": 100,
+    "spring_color": 100
+  }
+}

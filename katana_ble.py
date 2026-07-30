@@ -29,9 +29,23 @@ ADDR = {
     "amp": 0x20000600,       # 10 bytes
     "sw": 0x20000800,        # booster/mod/fx/delay/delay2/reverb switches
     "booster": 0x20000A00,   # booster var 1
+    "fx": 0x20001000,        # FX type (slot 1)
+    "fx_detail": 0x20001C00, # FX detail block (slot 1)
     "delay": 0x20002800,     # delay var 1
     "reverb": 0x20003400,    # reverb var 1
 }
+
+# FX type index in BTS resource list
+FX_PITCH_SHIFTER = 11
+
+# Pitch shifter fields inside FX_DETAIL (relative offsets)
+PS_VOICE = 0x48
+PS_MODE1 = 0x49
+PS_PITCH1 = 0x4A   # ofs 24  -> stored = pitch + 24
+PS_FINE1 = 0x4B    # ofs 50
+PS_PREDELAY1 = 0x4C  # INTEGER4x4
+PS_LEVEL1 = 0x50
+PS_DIRECT_MIX = 0x5A
 
 AMP_TYPE = ["acoustic", "clean", "pushed", "crunch", "lead", "brown"]
 DELAY_TYPE = [
@@ -374,6 +388,26 @@ class KatanaBLE:
                 bst[6] = int(b.get("effect_level", 50))
                 bst[7] = int(b.get("direct_mix", 0))
             await self.write_bytes(ADDR["booster"], bst)
+
+        fx = preset.get("fx")
+        if fx:
+            ftype = int(fx.get("type", FX_PITCH_SHIFTER))
+            await self.write_bytes(ADDR["fx"], [ftype & 0x7F])
+            # pitch shifter shortcut
+            if ftype == FX_PITCH_SHIFTER or fx.get("pitch_semitones") is not None:
+                pitch = int(fx.get("pitch_semitones", -1))
+                pitch = max(-24, min(24, pitch))
+                mode = int(fx.get("mode", 3))  # 3 ~ mono (good for lead)
+                level = int(fx.get("level", 100))
+                direct = int(fx.get("direct_mix", 0))  # 0 = fully transposed
+                base = ADDR["fx_detail"]
+                await self.write_bytes(base + PS_VOICE, [0])  # 1 voice
+                await self.write_bytes(base + PS_MODE1, [mode & 0x7F])
+                await self.write_bytes(base + PS_PITCH1, [(pitch + 24) & 0x7F])
+                await self.write_bytes(base + PS_FINE1, [50])  # fine 0
+                await self.write_bytes(base + PS_PREDELAY1, enc_4x4(0))
+                await self.write_bytes(base + PS_LEVEL1, [level & 0x7F])
+                await self.write_bytes(base + PS_DIRECT_MIX, [direct & 0x7F])
 
         await asyncio.sleep(0.3)
 
