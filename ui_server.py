@@ -221,23 +221,41 @@ async def connect():
         _state["busy"] = "connecting"
         _state["error"] = ""
         try:
-            # don't hold the ops lock for the whole BLE dance if possible
             try:
                 await asyncio.wait_for(_lock.acquire(), timeout=5.0)
             except asyncio.TimeoutError as e:
                 raise HTTPException(503, "BLE ocupado com outra operação") from e
             try:
                 _state["pitch_armed"] = False
-                k = await get_k(force=True, connect_timeout=40.0)
+                # Soft connect first — force+scan often causes le-connection-abort-by-local
+                try:
+                    k = await get_k(force=False, connect_timeout=20.0)
+                except Exception as soft_err:
+                    _state["error"] = f"soft: {soft_err}"
+                    k = await get_k(force=True, connect_timeout=35.0)
                 pitch = int(_state.get("pitch", -1) or -1)
                 try:
                     await asyncio.wait_for(ensure_pitch_mod(k, pitch, full=True), timeout=8.0)
                 except Exception:
-                    # pitch arm optional at connect
                     pass
                 _state["connected"] = True
                 _state["error"] = ""
-                return {"ok": True, "connected": True, "pitch": _state["pitch"]}
+                # quick identity
+                name = ""
+                try:
+                    p = await asyncio.wait_for(k.read_status_light(), timeout=4.0)
+                    name = p.get("name") or ""
+                    _state["name"] = name
+                    if p.get("amp"):
+                        pass
+                except Exception:
+                    pass
+                return {
+                    "ok": True,
+                    "connected": True,
+                    "pitch": _state["pitch"],
+                    "name": name,
+                }
             finally:
                 _lock.release()
         except HTTPException:

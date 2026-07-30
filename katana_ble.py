@@ -281,39 +281,61 @@ class KatanaBLE:
         if await self._is_connected():
             return
 
+        # Always stop discovery — active scan causes le-connection-abort-by-local
+        try:
+            await self._call("/org/bluez/hci0", "org.bluez.Adapter1", "StopDiscovery")
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
         last_err: Exception | None = None
         for attempt in range(1, retries + 1):
             try:
-                try:
-                    await self._call(self.dev, "org.bluez.Device1", "Disconnect")
-                except Exception:
-                    pass
-                await asyncio.sleep(0.6 + 0.3 * attempt)
+                if attempt == 1:
+                    # gentle: just Connect on already-bonded device
+                    await self._call(self.dev, "org.bluez.Device1", "Connect")
+                else:
+                    try:
+                        await self._call(self.dev, "org.bluez.Device1", "Disconnect")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.8 * attempt)
+                    # brief scan only on later retries
+                    await self._ble_scan_pulse(1.5)
+                    try:
+                        await self._call(
+                            "/org/bluez/hci0", "org.bluez.Adapter1", "StopDiscovery"
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.4)
+                    await self._call(self.dev, "org.bluez.Device1", "Connect")
 
-                await self._ble_scan_pulse(2.0 if attempt == 1 else 2.8)
-
-                await self._call(self.dev, "org.bluez.Device1", "Connect")
-                for _ in range(25):
+                for _ in range(30):
                     if await self._is_connected():
-                        await asyncio.sleep(0.8)
+                        await asyncio.sleep(0.6)
                         return
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.15)
                 last_err = RuntimeError("Connect returned but device stayed disconnected")
             except Exception as e:
                 last_err = e
                 msg = str(e).lower()
+                if "already connected" in msg or "in progress" in msg:
+                    await asyncio.sleep(1.0)
+                    if await self._is_connected():
+                        return
+                    continue
                 if any(
                     s in msg
                     for s in (
                         "abort-by-local",
                         "inprogress",
-                        "in progress",
                         "le-connection",
                         "br-connection",
                         "busy",
                     )
                 ):
-                    await asyncio.sleep(1.0 * attempt)
+                    await asyncio.sleep(1.2 * attempt)
                     continue
                 await asyncio.sleep(0.8 * attempt)
 
