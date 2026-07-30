@@ -40,51 +40,61 @@ _state = {
     "pitch": -1,
     "name": "",
     "error": "",
+    "pitch_armed": False,
 }
 
 
-async def get_k() -> KatanaBLE:
+async def get_k(*, force: bool = False) -> KatanaBLE:
     global _katana
+    if force and _katana is not None:
+        try:
+            await _katana.disconnect(drop_link=True)
+        except Exception:
+            pass
+        _katana = None
+        _state["connected"] = False
+        _state["pitch_armed"] = False
+        await asyncio.sleep(0.5)
+
     if _katana is None or not _state["connected"]:
         k = KatanaBLE()
-        await k.connect()
+        await k.connect(force=force)
         _katana = k
         _state["connected"] = True
         _state["error"] = ""
     return _katana
 
 
-async def ensure_pitch_mod(k: KatanaBLE, semis: int) -> None:
-    """Arm MOD pitch shifter params and turn MOD on."""
-    semis = max(-24, min(24, int(semis)))
-    # MOD on, keep delay/reverb as-is if possible
-    try:
-        sw = await k.request(ADDR["sw"], 0x06)
-        sw[1] = 1  # mod
-        # leave fx as-is (usually off for clean pitch)
-        await k.write_bytes(ADDR["sw"], sw)
-    except Exception:
-        await k.write_bytes(ADDR["sw"], [0, 1, 0, 1, 0, 1])
-
-    # Best-effort type = pitch shifter on MOD slots
-    for rel in (0x1000, 0x1200, 0x1400):
+async def with_k(fn):
+    """Run fn(k); on SysEx timeout, hard-reconnect once and retry."""
+    async with _lock:
         try:
-            await k.write_bytes(0x20000000 + rel, [11])
-        except Exception:
-            pass
-    await asyncio.sleep(0.15)
+            k = await get_k()
+            return await fn(k)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _state["error"] = err
+            _state["connected"] = False
+            # one hard reconnect retry
+            try:
+                k = await get_k(force=True)
+                return await fn(k)
+            except Exception as e2:
+                _state["connected"] = False
+                _state["error"] = f"{type(e2).__name__}: {e2}"
+                raise HTTPException(500, _state["error"]) from e2
 
-    for det in (0x1C00, 0x1E00, 0x2000):
-        base = 0x20000000 + det
-        await k.write_bytes(base + PS_VOICE, [0])
-        await k.write_bytes(base + PS_MODE1, [1])
-        await k.write_bytes(base + PS_PITCH1, [(semis + 24) & 0x7F])
-        await k.write_bytes(base + PS_FINE1, [50])
-        await k.write_bytes(base + PS_PREDELAY1, enc_4x4(0))
-        await k.write_bytes(base + PS_LEVEL1, [100])
-        await k.write_bytes(base + PS_DIRECT_MIX, [0])
 
+async def ensure_pitch_mod(k: KatanaBLE, semis: int, *, full: bool = False) -> int:
+    """Fast path: 1-byte pitch write. Full arm only once per session."""
+    semis = max(-24, min(24, int(semis)))
+    if full or not _state.get("pitch_armed"):
+        await k.arm_pitch_shifter(semis)
+        _state["pitch_armed"] = True
+    else:
+        await k.set_pitch(semis, slots=1)
     _state["pitch"] = semis
+    return semis
 
 
 @asynccontextmanager
@@ -118,88 +128,78 @@ async def index():
 
 @app.get("/api/status")
 async def status():
-    async with _lock:
-        try:
-            k = await get_k()
-            p = await k.read_patch()
-            # read live pitch from DET1
-            try:
-                d = await k.request(0x20001C48, 20)
-                pitch = d[2] - 24
-                _state["pitch"] = pitch
-            except Exception:
-                pitch = _state.get("pitch", 0)
-            _state["name"] = p.get("name", "")
-            return {
-                "connected": True,
-                "name": p.get("name"),
-                "pitch": pitch,
-                "amp": p.get("amp"),
-                "sw": p.get("sw"),
-                "error": "",
-            }
-        except Exception as e:
-            _state["connected"] = False
-            _state["error"] = f"{type(e).__name__}: {e}"
-            return {
+    async def _do(k: KatanaBLE):
+        p = await k.read_status_light()
+        _state["pitch"] = p.get("pitch", _state.get("pitch", 0))
+        _state["name"] = p.get("name", "")
+        _state["connected"] = True
+        _state["error"] = ""
+        return {
+            "connected": True,
+            "name": p.get("name"),
+            "pitch": p.get("pitch"),
+            "amp": p.get("amp"),
+            "sw": p.get("sw"),
+            "error": "",
+        }
+
+    try:
+        return await with_k(_do)
+    except HTTPException as he:
+        return JSONResponse(
+            {
                 "connected": False,
                 "name": "",
                 "pitch": _state.get("pitch", 0),
                 "amp": None,
                 "sw": None,
-                "error": _state["error"],
+                "error": he.detail,
             }
+        )
 
 
 @app.post("/api/connect")
 async def connect():
     async with _lock:
-        global _katana
         try:
-            if _katana:
-                try:
-                    await _katana.disconnect()
-                except Exception:
-                    pass
-                _katana = None
-            k = await get_k()
-            await ensure_pitch_mod(k, _state.get("pitch", -1))
-            return {"ok": True, "connected": True}
+            _state["pitch_armed"] = False
+            k = await get_k(force=True)
+            pitch = int(_state.get("pitch", -1) or -1)
+            await ensure_pitch_mod(k, pitch, full=True)
+            _state["connected"] = True
+            _state["error"] = ""
+            return {"ok": True, "connected": True, "pitch": _state["pitch"]}
         except Exception as e:
             _state["connected"] = False
-            raise HTTPException(500, str(e)) from e
+            _state["pitch_armed"] = False
+            _state["error"] = f"{type(e).__name__}: {e}"
+            raise HTTPException(500, _state["error"]) from e
 
 
 @app.post("/api/pitch")
 async def set_pitch(body: PitchIn):
-    async with _lock:
-        try:
-            k = await get_k()
-            await ensure_pitch_mod(k, body.semitones)
-            # readback
-            d = await k.request(0x20001C48, 12)
-            rb = d[2] - 24
-            return {"ok": True, "pitch": rb, "requested": body.semitones}
-        except Exception as e:
-            _state["connected"] = False
-            raise HTTPException(500, str(e)) from e
+    async def _do(k: KatanaBLE):
+        # no readback — fire-and-forget for lowest latency
+        rb = await ensure_pitch_mod(k, body.semitones, full=False)
+        _state["connected"] = True
+        return {"ok": True, "pitch": rb, "requested": body.semitones}
+
+    return await with_k(_do)
 
 
 @app.post("/api/amp")
 async def set_amp(body: AmpIn):
     if body.field not in AMP_FIELDS:
         raise HTTPException(400, f"unknown field, use one of {AMP_FIELDS}")
-    async with _lock:
-        try:
-            k = await get_k()
-            off = AMP_FIELDS.index(body.field)
-            await k.write_bytes(ADDR["amp"] + off, [body.value & 0x7F])
-            await asyncio.sleep(0.15)
-            amp = await k.request(ADDR["amp"], 0x0A)
-            return {"ok": True, "field": body.field, "value": amp[off]}
-        except Exception as e:
-            _state["connected"] = False
-            raise HTTPException(500, str(e)) from e
+
+    async def _do(k: KatanaBLE):
+        off = AMP_FIELDS.index(body.field)
+        # fire-and-forget write, no readback
+        await k.write_bytes(ADDR["amp"] + off, [body.value & 0x7F], gap=0.0, pace=0.0)
+        _state["connected"] = True
+        return {"ok": True, "field": body.field, "value": body.value}
+
+    return await with_k(_do)
 
 
 @app.get("/api/presets")
@@ -209,7 +209,13 @@ async def list_presets():
     for f in files:
         try:
             meta = json.loads(f.read_text())
-            out.append({"id": f.name, "name": meta.get("name", f.stem), "notes": meta.get("notes", "")})
+            out.append(
+                {
+                    "id": f.name,
+                    "name": meta.get("name", f.stem),
+                    "notes": meta.get("notes", ""),
+                }
+            )
         except Exception:
             out.append({"id": f.name, "name": f.stem, "notes": ""})
     return out
@@ -220,21 +226,25 @@ async def load_preset(preset_id: str):
     path = PRESETS / preset_id
     if not path.exists() or path.suffix != ".json":
         raise HTTPException(404, "preset not found")
-    async with _lock:
+
+    async def _do(k: KatanaBLE):
+        preset = json.loads(path.read_text())
+        await k.apply_preset(preset)
+        p = await k.read_patch()
         try:
-            k = await get_k()
-            preset = json.loads(path.read_text())
-            await k.apply_preset(preset)
-            p = await k.read_patch()
-            try:
-                d = await k.request(0x20001C48, 12)
-                _state["pitch"] = d[2] - 24
-            except Exception:
-                pass
-            return {"ok": True, "name": p.get("name"), "pitch": _state["pitch"], "amp": p.get("amp")}
-        except Exception as e:
-            _state["connected"] = False
-            raise HTTPException(500, str(e)) from e
+            d = await k.request(0x20001C48, 12)
+            _state["pitch"] = d[2] - 24
+        except Exception:
+            pass
+        _state["connected"] = True
+        return {
+            "ok": True,
+            "name": p.get("name"),
+            "pitch": _state["pitch"],
+            "amp": p.get("amp"),
+        }
+
+    return await with_k(_do)
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -390,30 +400,54 @@ function onSlide(v) {
   document.getElementById('pnote').textContent = `forma em E → soa ${openTo(+v)}  ·  Mi aberto = ${openTo(+v)}`;
 }
 let pitchTimer = null;
+let pitchInflight = false;
+let pitchQueued = null;
 function commitPitch(v) {
   clearTimeout(pitchTimer);
-  pitchTimer = setTimeout(() => setPitch(+v), 80);
+  // short coalesce while dragging — feels instant, one BLE write at a time
+  pitchTimer = setTimeout(() => setPitch(+v), 25);
 }
 async function setPitch(v) {
   v = +v;
   document.getElementById('pitch').value = v;
   onSlide(v);
-  document.getElementById('msg').textContent = 'enviando…';
+  if (pitchInflight) {
+    pitchQueued = v;
+    return;
+  }
+  pitchInflight = true;
+  document.getElementById('msg').textContent = '';
   try {
-    const r = await fetch('/api/pitch', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({semitones: v})
-    });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.detail || JSON.stringify(j));
-    document.getElementById('msg').textContent = `tom ${fmtPitch(j.pitch)} ok`;
-    setConn(true);
+    while (true) {
+      const send = (pitchQueued === null) ? v : pitchQueued;
+      pitchQueued = null;
+      const t0 = performance.now();
+      const r = await fetch('/api/pitch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({semitones: send})
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(fmtErr(j));
+      const ms = Math.round(performance.now() - t0);
+      document.getElementById('msg').textContent = `tom ${fmtPitch(j.pitch)} · ${ms}ms`;
+      setConn(true);
+      if (pitchQueued === null) break;
+      v = pitchQueued;
+    }
   } catch (e) {
     document.getElementById('msg').textContent = '';
     document.getElementById('err').textContent = String(e.message || e);
     setConn(false);
+  } finally {
+    pitchInflight = false;
   }
+}
+function fmtErr(j) {
+  if (!j) return 'erro';
+  if (typeof j.detail === 'string') return j.detail;
+  if (Array.isArray(j.detail)) return j.detail.map(x => x.msg || JSON.stringify(x)).join('; ');
+  return j.error || JSON.stringify(j);
 }
 function setConn(on, err) {
   const dot = document.getElementById('dot');
@@ -439,11 +473,12 @@ async function refresh() {
   }
 }
 async function connect() {
-  document.getElementById('msg').textContent = 'conectando…';
+  document.getElementById('msg').textContent = 'conectando (pode levar ~5s)…';
+  document.getElementById('err').textContent = '';
   try {
     const r = await fetch('/api/connect', {method:'POST'});
     const j = await r.json();
-    if (!r.ok) throw new Error(j.detail || JSON.stringify(j));
+    if (!r.ok) throw new Error(fmtErr(j));
     document.getElementById('msg').textContent = 'conectado';
     await refresh();
   } catch (e) {
@@ -462,10 +497,16 @@ function renderAmp(amp) {
     const div = document.createElement('div');
     div.innerHTML = `<div class="slabel"><span>${label}</span><span id="av_${key}">${val}</span></div>
       <input type="range" min="0" max="100" value="${val}" data-field="${key}"
-        oninput="document.getElementById('av_${key}').textContent=this.value"
+        oninput="onAmpInput('${key}', this.value)"
         onchange="setAmp('${key}', this.value)"/>`;
     root.appendChild(div);
   }
+}
+const ampTimers = {};
+function onAmpInput(field, value) {
+  document.getElementById('av_'+field).textContent = value;
+  clearTimeout(ampTimers[field]);
+  ampTimers[field] = setTimeout(() => setAmp(field, value), 40);
 }
 async function setAmp(field, value) {
   try {
@@ -474,7 +515,7 @@ async function setAmp(field, value) {
       body: JSON.stringify({field, value: +value})
     });
     const j = await r.json();
-    if (!r.ok) throw new Error(j.detail || JSON.stringify(j));
+    if (!r.ok) throw new Error(fmtErr(j));
     document.getElementById('av_'+field).textContent = j.value;
     setConn(true);
   } catch (e) {
@@ -509,7 +550,7 @@ async function loadPreset(id) {
 onSlide(0);
 loadPresets();
 refresh();
-setInterval(refresh, 12000);
+setInterval(refresh, 45000);
 </script>
 </body>
 </html>

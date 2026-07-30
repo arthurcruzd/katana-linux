@@ -158,8 +158,15 @@ class KatanaBLE:
             raise RuntimeError(f"{member}: {msg.error_name} {msg.body}")
         return msg.body
 
-    async def connect(self) -> None:
+    async def connect(self, *, force: bool = False) -> None:
+        if force:
+            await self.hard_reset_link()
+
         self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        self.io_path = None
+        self.sysex.clear()
+        self._buf = bytearray()
+
         try:
             props = await self._call(
                 self.dev, "org.freedesktop.DBus.Properties", "Get", "ss",
@@ -167,12 +174,12 @@ class KatanaBLE:
             )
             if not props[0].value:
                 await self._call(self.dev, "org.bluez.Device1", "Connect")
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.8)
         except RuntimeError:
             await self._call(self.dev, "org.bluez.Device1", "Connect")
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.8)
 
-        for _ in range(30):
+        for _ in range(40):
             objs = await self._call(
                 "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"
             )
@@ -188,9 +195,11 @@ class KatanaBLE:
                     break
             if self.io_path:
                 break
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.25)
         if not self.io_path:
-            raise RuntimeError("BLE-MIDI char not found (MIDI mode? bonded?)")
+            raise RuntimeError(
+                "BLE-MIDI char not found. Amp in MIDI mode? LED solid? Phone disconnected?"
+            )
 
         await self._call(
             "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s",
@@ -215,10 +224,49 @@ class KatanaBLE:
             ble_unwrap_feed(self._buf, raw, on_sysex)
 
         self.bus.add_message_handler(handler)
-        await self._call(self.io_path, "org.bluez.GattCharacteristic1", "StartNotify")
-        await asyncio.sleep(0.3)
 
-    async def disconnect(self) -> None:
+        # Restart notify cleanly (stale CCCD kills SysEx replies)
+        try:
+            await self._call(self.io_path, "org.bluez.GattCharacteristic1", "StopNotify")
+        except Exception:
+            pass
+        await asyncio.sleep(0.15)
+        await self._call(self.io_path, "org.bluez.GattCharacteristic1", "StartNotify")
+        await asyncio.sleep(0.4)
+
+        # Probe that SysEx path is alive
+        try:
+            await self.request(ADDR["com"], 0x10, timeout=3.0)
+        except TimeoutError:
+            # one automatic hard retry
+            if not force:
+                await self.disconnect(drop_link=True)
+                await asyncio.sleep(1.0)
+                await self.connect(force=True)
+                return
+            raise TimeoutError(
+                "conectado no Bluetooth, mas o amp não responde SysEx. "
+                "Segure o botão do BT-DUAL até piscar (modo MIDI), "
+                "feche o app do celular e tente Conectar de novo."
+            ) from None
+
+    async def hard_reset_link(self) -> None:
+        """Drop BlueZ ACL link so the next Connect is fresh."""
+        try:
+            if not self.bus:
+                self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                await self._call(self.dev, "org.bluez.Device1", "Disconnect")
+            except Exception:
+                pass
+            await asyncio.sleep(1.2)
+        except Exception:
+            pass
+        self.io_path = None
+        self.sysex.clear()
+        self._buf = bytearray()
+
+    async def disconnect(self, *, drop_link: bool = False) -> None:
         if self.io_path and self.bus:
             try:
                 await self._call(
@@ -226,37 +274,90 @@ class KatanaBLE:
                 )
             except Exception:
                 pass
+        if drop_link and self.bus:
+            try:
+                await self._call(self.dev, "org.bluez.Device1", "Disconnect")
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+        self.io_path = None
 
-    async def send_sysex(self, msg: bytes) -> None:
+    async def send_sysex(self, msg: bytes, *, gap: float = 0.012) -> None:
         assert self.io_path
-        for pkt in ble_wrap(msg):
+        pkts = ble_wrap(msg)
+        for i, pkt in enumerate(pkts):
             await self._call(
-                self.io_path, "org.bluez.GattCharacteristic1", "WriteValue",
+                self.io_path,
+                "org.bluez.GattCharacteristic1",
+                "WriteValue",
                 "aya{sv}",
                 [bytes(pkt), {"type": Variant("s", "command")}],
             )
-            await asyncio.sleep(0.03)
+            # only pace multi-packet SysEx; single-packet is fire-and-forget
+            if gap > 0 and i + 1 < len(pkts):
+                await asyncio.sleep(gap)
 
-    async def request(self, addr: int, size: int, timeout: float = 3.5) -> list[int]:
+    async def request(self, addr: int, size: int, timeout: float = 2.5) -> list[int]:
         before = len(self.sysex)
-        await self.send_sysex(rq1(addr, size))
+        await self.send_sysex(rq1(addr, size), gap=0.008)
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
             for s in self.sysex[before:]:
                 p = parse_dt1(s)
                 if p and p[0] == addr:
                     return p[1]
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.015)
         raise TimeoutError(f"no DT1 for {addr:#010x}")
 
-    async def write_bytes(self, addr: int, data: list[int]) -> None:
-        # chunk large payloads to stay under SYSEX_MAXLEN-ish ATT limits
+    async def write_bytes(
+        self, addr: int, data: list[int], *, gap: float = 0.012, pace: float = 0.0
+    ) -> None:
+        """Write DT1. pace=extra delay after each chunk (0 for low-latency)."""
         off = 0
         while off < len(data):
-            chunk = data[off: off + 40]
-            await self.send_sysex(dt1(addr + off, chunk))
-            await asyncio.sleep(0.08)
+            chunk = data[off : off + 40]
+            await self.send_sysex(dt1(addr + off, chunk), gap=gap)
+            if pace > 0:
+                await asyncio.sleep(pace)
             off += len(chunk)
+
+    async def set_pitch(self, semis: int, *, slots: int = 1) -> int:
+        """Low-latency pitch change. slots=1 writes only MOD green (DET1)."""
+        semis = max(-24, min(24, int(semis)))
+        stored = (semis + 24) & 0x7F
+        dets = (0x1C00, 0x1E00, 0x2000)[: max(1, min(3, slots))]
+        for det in dets:
+            # single-byte DT1 — one BLE packet
+            await self.write_bytes(0x20000000 + det + PS_PITCH1, [stored], gap=0.0, pace=0.0)
+        return semis
+
+    async def arm_pitch_shifter(self, semis: int = -1) -> None:
+        """One-shot setup: MOD on + pitch params. Call once per session."""
+        semis = max(-24, min(24, int(semis)))
+        stored = (semis + 24) & 0x7F
+        # MOD on without full SW read when possible
+        try:
+            sw = await self.request(ADDR["sw"], 0x06, timeout=1.5)
+            if sw[1] != 1:
+                sw[1] = 1
+                await self.write_bytes(ADDR["sw"], sw, pace=0.0)
+        except Exception:
+            await self.write_bytes(ADDR["sw"], [0, 1, 0, 1, 0, 1], pace=0.0)
+
+        for rel in (0x1000, 0x1200, 0x1400):
+            try:
+                await self.write_bytes(0x20000000 + rel, [11], pace=0.0)
+            except Exception:
+                pass
+
+        # Batch pitch block: voice, mode, pitch, fine at 0x48..0x4B
+        # then level @0x50 and direct @0x5A
+        for det in (0x1C00, 0x1E00, 0x2000):
+            base = 0x20000000 + det
+            await self.write_bytes(base + PS_VOICE, [0, 1, stored, 50], pace=0.0)
+            await self.write_bytes(base + PS_PREDELAY1, enc_4x4(0), pace=0.0)
+            await self.write_bytes(base + PS_LEVEL1, [100], pace=0.0)
+            await self.write_bytes(base + PS_DIRECT_MIX, [0], pace=0.0)
 
     async def identity(self) -> bytes | None:
         before = len(self.sysex)
@@ -266,6 +367,29 @@ class KatanaBLE:
             if len(s) > 5 and s[1] == 0x7E and s[3] == 0x06 and s[4] == 0x02:
                 return s
         return None
+
+    async def read_status_light(self) -> dict[str, Any]:
+        """Fast status: name + amp + sw + pitch only (4 RQ1s)."""
+        name_raw = await self.request(ADDR["com"], 0x10, timeout=2.0)
+        name = bytes(b for b in name_raw if 32 <= b < 127).decode("ascii", "replace").rstrip()
+        amp = await self.request(ADDR["amp"], 0x0A, timeout=2.0)
+        sw = await self.request(ADDR["sw"], 0x06, timeout=2.0)
+        pitch = 0
+        try:
+            d = await self.request(0x20001C48, 4, timeout=1.5)
+            pitch = d[2] - 24
+        except Exception:
+            pass
+        amp_d = {f: amp[i] for i, f in enumerate(AMP_FIELDS)}
+        amp_d["type_name"] = (
+            AMP_TYPE[amp_d["type"]] if amp_d["type"] < len(AMP_TYPE) else str(amp_d["type"])
+        )
+        return {
+            "name": name,
+            "amp": amp_d,
+            "sw": {f: sw[i] for i, f in enumerate(SW_FIELDS)},
+            "pitch": pitch,
+        }
 
     async def read_patch(self) -> dict[str, Any]:
         name_raw = await self.request(ADDR["com"], 0x10)
