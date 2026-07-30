@@ -1,0 +1,64 @@
+{
+  "name": "Offspring Punk",
+  "notes": "The Offspring — classic 90s punk rhythm (Come Out and Play / Self Esteem / Kids Aren't Alright). Crunch, mid-forward, tight bass, almost dry. Palm mutes and power chords cut; not metal brown.",
+  "song": "The Offspring — general rhythm (Smash / Americana era)",
+  "tuning": "E standard (or half-step down)",
+  "amp": {
+    "gain": 58,
+    "volume": 40,
+    "bass": 44,
+    "middle": 68,
+    "treble": 64,
+    "presence": 55,
+    "poweramp_variation": 1,
+    "type": 3,
+    "type_name": "crunch",
+    "resonance": 40,
+    "preamp_variation": 0
+  },
+  "sw": {
+    "booster": 1,
+    "mod": 0,
+    "fx": 0,
+    "delay": 0,
+    "delay2": 0,
+    "reverb": 0
+  },
+  "booster": {
+    "type": 11,
+    "type_name": "t_scream",
+    "drive": 35,
+    "bottom": -8,
+    "tone": 8,
+    "solo_sw": 0,
+    "solo_level": 50,
+    "effect_level": 48,
+    "direct_mix": 0
+  },
+  "delay": {
+    "type": 0,
+    "type_name": "digital",
+    "time_ms": 350,
+    "feedback": 10,
+    "high_cut": 10,
+    "effect_level": 0,
+    "direct_level": 100,
+    "tap_time": 50,
+    "mod_rate": 40,
+    "mod_depth": 40,
+    "lpf": 1
+  },
+  "reverb": {
+    "type": 1,
+    "type_name": "room",
+    "layer_mode": 2,
+    "time": 18,
+    "pre_delay_ms": 8,
+    "low_cut": 14,
+    "high_cut": 10,
+    "density": 6,
+    "effect_level": 8,
+    "direct_level": 100,
+    "spring_color": 100
+  }
+}
