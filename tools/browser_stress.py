@@ -43,6 +43,8 @@ def main() -> int:
         page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" and "404" not in m.text else None)
         page.goto(BASE, wait_until="networkidle", timeout=15_000)
         page.wait_for_selector(".card", timeout=10_000)
+        page.wait_for_selector("#btnLive", timeout=2_000)
+        assert page.evaluate("typeof prepareLive === 'function' && liveSlots instanceof Map")
 
         # Connect if needed.
         if page.locator("#conn").inner_text() != "conectado":

@@ -4,3 +4,4 @@ __pycache__/
 /tmp/
 *.log
 .DS_Store
+.katana-live.json

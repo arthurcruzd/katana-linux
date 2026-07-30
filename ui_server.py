@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,6 +20,7 @@ from katana_ble import ADDR, AMP_FIELDS, KatanaBLE
 
 ROOT = Path(__file__).resolve().parent
 PRESETS = ROOT / "presets"
+LIVE_STATE = ROOT / ".katana-live.json"
 
 # _ops_lock serializes BLE I/O only (short holds)
 # _connect_lock prevents parallel connect attempts
@@ -26,6 +28,7 @@ _ops_lock = asyncio.Lock()
 _connect_lock = asyncio.Lock()
 _katana: KatanaBLE | None = None
 _connect_task: asyncio.Task | None = None
+_live_slots: dict[str, dict] = {}
 _state = {
     "connected": False,
     "pitch": -1,
@@ -164,10 +167,67 @@ class AmpIn(BaseModel):
     value: int = Field(..., ge=0, le=120)
 
 
+class LivePrepareIn(BaseModel):
+    preset_ids: list[str] = Field(..., min_length=1, max_length=10)
+
+
 class PresetPatchIn(BaseModel):
     amp: dict[str, int | str | float | None] | None = None
     pitch_semitones: int | None = Field(default=None, ge=-24, le=24)
     sw: dict[str, int] | None = None
+
+
+def _preset_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _save_live_slots() -> None:
+    tmp = LIVE_STATE.with_suffix(LIVE_STATE.suffix + ".tmp")
+    tmp.write_text(json.dumps(_live_slots, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(LIVE_STATE)
+
+
+def _load_live_slots() -> None:
+    _live_slots.clear()
+    if not LIVE_STATE.exists():
+        return
+    try:
+        data = json.loads(LIVE_STATE.read_text())
+        if isinstance(data, dict):
+            _live_slots.update(data)
+    except (OSError, ValueError):
+        return
+
+
+def _verification_ranges(preset: dict) -> list[tuple[int, int]]:
+    raw = preset.get("raw_blocks")
+    if isinstance(raw, dict) and raw:
+        from tools.patch_map import PATCH_REL
+
+        readable = {"COM", "AMP", "SW"}
+        ranges: list[tuple[int, int]] = []
+        for key, data in raw.items():
+            name = str(key).split("%", 1)[-1]
+            rel = PATCH_REL.get(name)
+            if name in readable and rel is not None and isinstance(data, list) and data:
+                ranges.append((rel, len(data)))
+        return ranges
+    return [
+        (0x0000, 16),  # COM/name
+        (0x0600, 10),  # AMP
+        (0x0800, 6),   # SW
+    ]
+
+
+def _valid_live_entry(preset_id: str, path: Path) -> dict | None:
+    entry = _live_slots.get(preset_id)
+    if not entry or entry.get("digest") != _preset_digest(path):
+        return None
+    slot = int(entry.get("slot", -1))
+    return entry if 0 <= slot < 10 else None
+
+
+_load_live_slots()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -369,6 +429,74 @@ async def list_presets():
     return out
 
 
+@app.get("/api/live")
+async def live_status():
+    valid = []
+    for preset_id, entry in _live_slots.items():
+        path = PRESETS / preset_id
+        if path.exists() and _valid_live_entry(preset_id, path):
+            valid.append({"id": preset_id, "slot": int(entry["slot"])})
+    return {"ready": bool(valid), "slots": sorted(valid, key=lambda x: x["slot"])}
+
+
+@app.post("/api/live/prepare")
+async def prepare_live(body: LivePrepareIn):
+    preset_ids = list(dict.fromkeys(body.preset_ids))
+    if len(preset_ids) != len(body.preset_ids):
+        raise HTTPException(400, "presets duplicados")
+
+    prepared: list[tuple[str, Path, dict]] = []
+    for preset_id in preset_ids:
+        path = (PRESETS / preset_id).resolve()
+        if not str(path).startswith(str(PRESETS.resolve())) or path.suffix != ".json":
+            raise HTTPException(400, f"preset inválido: {preset_id}")
+        if not path.exists():
+            raise HTTPException(404, f"preset não encontrado: {preset_id}")
+        prepared.append((preset_id, path, json.loads(path.read_text())))
+
+    async def _do(k: KatanaBLE):
+        _state["busy"] = "preparing-live"
+        new_slots: dict[str, dict] = {}
+        try:
+            for slot, (preset_id, path, preset) in enumerate(prepared):
+                await k.apply_preset(preset, volume_cap=50)
+                await k.write_current_patch_to_slot(slot)
+                await asyncio.sleep(0.55)
+                verified_bytes = await k.verify_slot_matches_live(
+                    slot, _verification_ranges(preset)
+                )
+                new_slots[preset_id] = {
+                    "slot": slot,
+                    "digest": _preset_digest(path),
+                    "name": preset.get("name") or path.stem,
+                    "verified_bytes": verified_bytes,
+                    "volume_cap": 50,
+                }
+            _live_slots.clear()
+            _live_slots.update(new_slots)
+            _save_live_slots()
+            await k.select_patch(0)
+            first_id, _, first = prepared[0]
+            _state["active_preset"] = first_id
+            _state["name"] = first.get("name") or first_id
+            _state["pitch_armed"] = False
+            _state["connected"] = True
+            return {
+                "ok": True,
+                "prepared": len(new_slots),
+                "active": first_id,
+                "slots": [
+                    {"id": preset_id, "slot": entry["slot"], "name": entry["name"]}
+                    for preset_id, entry in new_slots.items()
+                ],
+            }
+        finally:
+            if _state.get("busy") == "preparing-live":
+                _state["busy"] = ""
+
+    return await with_ops(_do, wait_busy=300.0)
+
+
 @app.post("/api/presets/{preset_id:path}/load")
 async def load_preset(preset_id: str):
     path = PRESETS / preset_id
@@ -380,6 +508,33 @@ async def load_preset(preset_id: str):
         try:
             preset = json.loads(path.read_text())
             _state["pitch_armed"] = False
+            live_entry = _valid_live_entry(preset_id, path)
+            if live_entry is not None:
+                slot = int(live_entry["slot"])
+                await k.select_patch(slot)
+                effective_amp = dict(preset.get("amp") or {})
+                cap = int(live_entry.get("volume_cap", 50))
+                if effective_amp.get("volume") is not None:
+                    effective_amp["volume"] = min(int(effective_amp["volume"]), cap)
+                fx = preset.get("fx") or {}
+                if fx.get("pitch_semitones") is not None:
+                    _state["pitch"] = int(fx["pitch_semitones"])
+                _state["name"] = preset.get("name") or path.stem
+                _state["active_preset"] = preset_id
+                _state["connected"] = True
+                return {
+                    "ok": True,
+                    "id": preset_id,
+                    "name": _state["name"],
+                    "pitch": _state.get("pitch"),
+                    "amp": effective_amp,
+                    "full": bool(preset.get("raw_blocks")),
+                    "chain": (preset.get("chain") or {}).get("label"),
+                    "readback_ok": False,
+                    "warning": "",
+                    "atomic": True,
+                    "live_slot": slot,
+                }
             await k.apply_preset(preset, volume_cap=50)
             # Writes completed: readback is diagnostic, never grounds for failure.
             p = {
@@ -415,6 +570,8 @@ async def load_preset(preset_id: str):
                 "chain": (preset.get("chain") or {}).get("label"),
                 "readback_ok": readback_ok,
                 "warning": warning,
+                "atomic": False,
+                "live_slot": None,
             }
         finally:
             if _state.get("busy") == "loading":

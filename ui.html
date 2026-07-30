@@ -153,6 +153,11 @@
     font-size: .75rem;
     font-weight: 500;
   }
+  .card.live-ready { border-color: rgba(61,214,140,.48); }
+  .tag.live-slot {
+    color: var(--ok); border-color: rgba(61,214,140,.55);
+    background: rgba(61,214,140,.07); font-weight: 650;
+  }
   .card.loading { opacity: .55; pointer-events: none; }
   .card.loading::after {
     content: "…";
@@ -275,6 +280,7 @@
     <div class="top-right">
       <div class="badge"><span class="dot" id="dot"></span><span id="conn">…</span></div>
       <button class="primary" id="btnConnect" onclick="connect()">Conectar</button>
+      <button id="btnLive" onclick="prepareLive()">Preparar Live</button>
       <button onclick="refresh()">Atualizar</button>
     </div>
   </header>
@@ -372,6 +378,8 @@ let pitchQueued = null;
 let saveTimer = null;
 let bleGen = 0;              // invalidates stale controls when preset changes
 let bleTail = Promise.resolve();
+let liveSlots = new Map();   // preset id -> internal slot 0..9
+let livePreparing = false;
 
 function bleEnqueue(fn) {
   const p = bleTail.then(fn, fn);
@@ -433,7 +441,10 @@ async function persistPreset(reason) {
       p.hay = [p.name, p.song, p.tuning, p.notes, p.id, p.artist, p.ampName].join(' ').toLowerCase();
     }
     const label = reason || 'preset';
-    document.getElementById('msg').textContent = `salvo · ${label}`;
+    liveSlots.delete(presetId); // edited JSON no longer matches the prepared slot hash
+    renderGrid();
+    updateLiveButton();
+    document.getElementById('msg').textContent = `salvo · ${label} · prepare Live novamente`;
   } catch (e) {
     document.getElementById('err').textContent = 'salvar preset: ' + (e.message || e);
   }
@@ -520,6 +531,59 @@ async function loadPresets() {
   applyFilter();
 }
 
+async function loadLiveStatus() {
+  try {
+    const j = await apiJSON('/api/live', {}, { retries: 2 });
+    liveSlots = new Map((j.slots || []).map(x => [x.id, x.slot]));
+  } catch (e) {
+    liveSlots = new Map();
+  }
+  renderGrid();
+  updateLiveButton();
+}
+
+function updateLiveButton() {
+  const btn = document.getElementById('btnLive');
+  if (!btn) return;
+  const n = filtered.length;
+  const ready = filtered.filter(p => liveSlots.has(p.id)).length;
+  btn.disabled = livePreparing || n < 1 || n > 10;
+  btn.textContent = livePreparing ? 'Preparando Live…'
+    : n > 10 ? 'Filtre até 10 presets'
+    : ready === n && n ? `Live pronto · ${n}`
+    : `Preparar Live · ${n}`;
+}
+
+async function prepareLive() {
+  if (livePreparing) return;
+  const ids = filtered.map(p => p.id);
+  if (!ids.length || ids.length > 10) {
+    document.getElementById('err').textContent = 'Use os filtros ou a busca para deixar entre 1 e 10 presets.';
+    return;
+  }
+  const names = filtered.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
+  if (!confirm(`Preparar ${ids.length} presets para troca atômica?\n\nIsso sobrescreve os slots internos correspondentes do Katana:\n\n${names}`)) return;
+  livePreparing = true;
+  updateLiveButton();
+  document.getElementById('err').textContent = '';
+  document.getElementById('msg').textContent = `preparando ${ids.length} slots · não toque nos controles…`;
+  try {
+    const j = await bleEnqueue(() => apiJSON('/api/live/prepare', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preset_ids: ids })
+    }, { retries: 2 }));
+    liveSlots = new Map((j.slots || []).map(x => [x.id, x.slot]));
+    renderGrid();
+    document.getElementById('msg').textContent = `Live pronto · ${j.prepared} slots verificados`;
+    if (j.active) await loadPreset(j.active);
+  } catch (e) {
+    document.getElementById('err').textContent = `preparar Live: ${e.message || e}`;
+  } finally {
+    livePreparing = false;
+    updateLiveButton();
+  }
+}
+
 function buildRail() {
   const artists = {};
   const tunings = {};
@@ -581,6 +645,7 @@ function applyFilter() {
     : `Amp: ${activeFilter.value}`;
   document.getElementById('mainTitle').textContent = title;
   document.getElementById('mainCount').textContent = `${filtered.length} preset${filtered.length===1?'':'s'}`;
+  updateLiveButton();
 }
 
 function renderGrid() {
@@ -592,11 +657,14 @@ function renderGrid() {
   grid.innerHTML = filtered.map(p => {
     const sel = p.id === selectedId ? 'selected' : '';
     const live = p.id === current.presetId || p.name === current.name ? ' live' : '';
+    const liveSlot = liveSlots.has(p.id) ? liveSlots.get(p.id) : null;
+    const ready = liveSlot !== null ? ' live-ready' : '';
     const tags = [];
+    if (liveSlot !== null) tags.push(`<span class="tag live-slot">LIVE · ${liveSlot + 1}</span>`);
     if (p.tuning) tags.push(`<span class="tag tuning">${esc(p.tuning)}</span>`);
     if (p.ampName) tags.push(`<span class="tag amp">${esc(p.ampName)}</span>`);
     if (p.artist && p.artist !== 'Outros') tags.push(`<span class="tag">${esc(p.artist)}</span>`);
-    return `<div class="card ${sel}${live}" data-id="${escAttr(p.id)}" tabindex="-1">
+    return `<div class="card ${sel}${live}${ready}" data-id="${escAttr(p.id)}" tabindex="-1">
       <div class="name">${esc(p.name)}</div>
       <div class="song">${esc(p.song || p.notes || p.id)}</div>
       <div class="meta">${tags.join('')}</div>
@@ -690,7 +758,9 @@ async function loadPreset(id, existingGen = null) {
         const ms = Math.round(performance.now() - t0);
         current.presetId = j.id || send;
         current.name = j.name || send;
-        document.getElementById('msg').textContent = j.warning
+        document.getElementById('msg').textContent = j.atomic
+          ? `LIVE · slot ${j.live_slot + 1} · ${ms}ms`
+          : j.warning
           ? `preset aplicado · sem confirmação · ${ms}ms`
           : `preset ok · ${ms}ms`;
         document.getElementById('npName').textContent = j.name || send;
@@ -1009,7 +1079,10 @@ document.addEventListener('keydown', (e) => {
 document.getElementById('q').addEventListener('input', () => applyFilter());
 
 onSlide(0);
-loadPresets().then(refresh);
+loadPresets().then(async () => {
+  await loadLiveStatus();
+  await refresh();
+});
 setInterval(refresh, 60000);
 </script>
 </body>

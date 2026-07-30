@@ -35,6 +35,11 @@ ADDR = {
     "reverb": 0x20003400,    # reverb var 1
 }
 
+PATCH_SLOT_BASES = (
+    0x20100000, 0x20200000, 0x20300000, 0x20400000, 0x20500000,
+    0x20600000, 0x20700000, 0x21000000, 0x21100000, 0x21200000,
+)
+
 # FX type index in BTS resource list
 FX_PITCH_SHIFTER = 11
 
@@ -62,6 +67,24 @@ SW_FIELDS = ["booster", "mod", "fx", "delay", "delay2", "reverb"]
 
 def a4(v: int) -> list[int]:
     return [(v >> 24) & 0x7F, (v >> 16) & 0x7F, (v >> 8) & 0x7F, v & 0x7F]
+
+
+def addr_add(addr: int, offset: int) -> int:
+    """Add a byte offset to a Roland four-byte base-128 address."""
+    if offset < 0:
+        raise ValueError("address offset must be non-negative")
+    parts = a4(addr)
+    logical = 0
+    for part in parts:
+        logical = logical * 128 + part
+    logical += int(offset)
+    out = [0, 0, 0, 0]
+    for i in range(3, -1, -1):
+        out[i] = logical & 0x7F
+        logical >>= 7
+    if logical:
+        raise ValueError("Roland address overflow")
+    return (out[0] << 24) | (out[1] << 16) | (out[2] << 8) | out[3]
 
 
 def checksum(body: list[int]) -> int:
@@ -412,10 +435,61 @@ class KatanaBLE:
         off = 0
         while off < len(data):
             chunk = data[off : off + 40]
-            await self.send_sysex(dt1(addr + off, chunk), gap=gap)
+            await self.send_sysex(dt1(addr_add(addr, off), chunk), gap=gap)
             if pace > 0:
                 await asyncio.sleep(pace)
             off += len(chunk)
+
+    async def select_patch(self, slot: int) -> int:
+        """Atomically recall one of the ten internal user-patch slots."""
+        slot = int(slot)
+        if not 0 <= slot < 10:
+            raise ValueError("live slot must be between 0 and 9")
+        await self.write_bytes(0x7F000100, [0, slot], gap=0.0, pace=0.0)
+        return slot
+
+    async def write_current_patch_to_slot(self, slot: int, *, timeout: float = 4.0) -> int:
+        """Persist the current temp patch and wait for the firmware DT1 ack."""
+        slot = int(slot)
+        if not 0 <= slot < 10:
+            raise ValueError("live slot must be between 0 and 9")
+        payload = [0, slot]
+        await self.write_bytes(0x7F000001, [1], gap=0.0, pace=0.0)
+        await asyncio.sleep(0.05)
+        before = len(self.sysex)
+        await self.write_bytes(0x7F000104, payload, gap=0.0, pace=0.0)
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            for msg in self.sysex[before:]:
+                parsed = parse_dt1(msg)
+                if parsed and parsed[0] == 0x7F000104 and parsed[1][:2] == payload:
+                    return slot
+            await asyncio.sleep(0.015)
+        raise TimeoutError(f"no PATCH_WRITE acknowledgement for slot {slot}")
+
+    async def verify_slot_matches_live(
+        self, slot: int, ranges: list[tuple[int, int]], *, timeout: float = 3.0
+    ) -> int:
+        """Compare selected temp-patch ranges with a persistent slot via RQ1."""
+        slot = int(slot)
+        if not 0 <= slot < len(PATCH_SLOT_BASES):
+            raise ValueError("live slot must be between 0 and 9")
+        checked = 0
+        for rel, size in ranges:
+            live_start = 0x20000000 + int(rel)
+            slot_start = PATCH_SLOT_BASES[slot] + int(rel)
+            off = 0
+            while off < int(size):
+                chunk_size = min(40, int(size) - off)
+                live = await self.request(addr_add(live_start, off), chunk_size, timeout=timeout)
+                stored = await self.request(addr_add(slot_start, off), chunk_size, timeout=timeout)
+                if list(live) != list(stored):
+                    raise RuntimeError(
+                        f"slot {slot} verification mismatch at PATCH+{rel:#06x}+{off:#04x}"
+                    )
+                checked += chunk_size
+                off += chunk_size
+        return checked
 
     async def set_pitch(self, semis: int, *, slots: int = 1) -> int:
         """Low-latency pitch change. slots=1 writes only MOD green (DET1)."""
