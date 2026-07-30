@@ -214,11 +214,12 @@ async def test_prepare_live_writes_and_maps_slots() -> None:
             assert state_path.exists(), "prepare_live must persist the slot manifest"
     assert result["ok"] is True
     assert result["prepared"] == 2
-    assert fake.written_slots == [0, 1]
-    assert [slot for slot, _ in fake.verified_slots] == [0, 1]
-    assert fake.selected[-1] == 0
-    assert s._live_slots[ids[0]]["slot"] == 0
-    assert s._live_slots[ids[1]]["slot"] == 1
+    assert s.LIVE_PATCH_SLOTS == (1, 2, 5, 6)
+    assert fake.written_slots == [1, 2]
+    assert [slot for slot, _ in fake.verified_slots] == [1, 2]
+    assert fake.selected[-1] == 1
+    assert s._live_slots[ids[0]]["slot"] == 1
+    assert s._live_slots[ids[1]]["slot"] == 2
     assert all(s._live_slots[x]["digest"] for x in ids)
     print("PASS live preparation writes, maps and recalls first slot")
 
@@ -293,6 +294,24 @@ async def test_verification_ranges_skip_unreadable_fx_blocks() -> None:
     print("PASS verification skips firmware-unreadable FX blocks")
 
 
+async def test_slot_verification_retries_transient_read_timeout() -> None:
+    k = KatanaBLE()
+    attempts = {}
+
+    async def flaky_request(addr, size, **kwargs):
+        attempts[addr] = attempts.get(addr, 0) + 1
+        if attempts[addr] == 1:
+            raise TimeoutError(f"transient {addr:#x}")
+        return [7] * size
+
+    k.request = flaky_request
+    checked = await k.verify_slot_matches_live(0, [(0x0000, 16)], retries=2)
+    assert checked == 16
+    assert attempts[0x20000000] == 2
+    assert attempts[0x20100000] == 2
+    print("PASS slot verification retries transient RQ1 timeout")
+
+
 async def main() -> None:
     await test_shared_connect()
     await test_command_waits_connect()
@@ -307,6 +326,7 @@ async def main() -> None:
     await test_roland_address_addition()
     await test_slot_readback_verification()
     await test_verification_ranges_skip_unreadable_fx_blocks()
+    await test_slot_verification_retries_transient_read_timeout()
     print("PASS all state-machine regressions")
 
 

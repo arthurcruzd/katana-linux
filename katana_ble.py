@@ -468,12 +468,31 @@ class KatanaBLE:
         raise TimeoutError(f"no PATCH_WRITE acknowledgement for slot {slot}")
 
     async def verify_slot_matches_live(
-        self, slot: int, ranges: list[tuple[int, int]], *, timeout: float = 3.0
+        self,
+        slot: int,
+        ranges: list[tuple[int, int]],
+        *,
+        timeout: float = 3.0,
+        retries: int = 3,
     ) -> int:
         """Compare selected temp-patch ranges with a persistent slot via RQ1."""
         slot = int(slot)
         if not 0 <= slot < len(PATCH_SLOT_BASES):
             raise ValueError("live slot must be between 0 and 9")
+        retries = max(1, int(retries))
+
+        async def read_retry(addr: int, size: int) -> list[int]:
+            last_error: Exception | None = None
+            for attempt in range(retries):
+                try:
+                    return await self.request(addr, size, timeout=timeout)
+                except TimeoutError as e:
+                    last_error = e
+                    if attempt + 1 < retries:
+                        await asyncio.sleep(0.25 * (attempt + 1))
+            assert last_error is not None
+            raise last_error
+
         checked = 0
         for rel, size in ranges:
             live_start = 0x20000000 + int(rel)
@@ -481,9 +500,16 @@ class KatanaBLE:
             off = 0
             while off < int(size):
                 chunk_size = min(40, int(size) - off)
-                live = await self.request(addr_add(live_start, off), chunk_size, timeout=timeout)
-                stored = await self.request(addr_add(slot_start, off), chunk_size, timeout=timeout)
-                if list(live) != list(stored):
+                live_addr = addr_add(live_start, off)
+                slot_addr = addr_add(slot_start, off)
+                for compare_attempt in range(retries):
+                    live = await read_retry(live_addr, chunk_size)
+                    stored = await read_retry(slot_addr, chunk_size)
+                    if list(live) == list(stored):
+                        break
+                    if compare_attempt + 1 < retries:
+                        await asyncio.sleep(0.25 * (compare_attempt + 1))
+                else:
                     raise RuntimeError(
                         f"slot {slot} verification mismatch at PATCH+{rel:#06x}+{off:#04x}"
                     )

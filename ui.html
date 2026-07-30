@@ -542,14 +542,18 @@ async function loadLiveStatus() {
   updateLiveButton();
 }
 
+function liveSlotLabel(slot) {
+  return ({1: 'A · CH1', 2: 'A · CH2', 5: 'B · CH1', 6: 'B · CH2'})[slot] || `slot ${slot}`;
+}
+
 function updateLiveButton() {
   const btn = document.getElementById('btnLive');
   if (!btn) return;
   const n = filtered.length;
   const ready = filtered.filter(p => liveSlots.has(p.id)).length;
-  btn.disabled = livePreparing || n < 1 || n > 10;
+  btn.disabled = livePreparing || n < 1 || n > 4;
   btn.textContent = livePreparing ? 'Preparando Live…'
-    : n > 10 ? 'Filtre até 10 presets'
+    : n > 4 ? 'Filtre até 4 presets'
     : ready === n && n ? `Live pronto · ${n}`
     : `Preparar Live · ${n}`;
 }
@@ -557,12 +561,12 @@ function updateLiveButton() {
 async function prepareLive() {
   if (livePreparing) return;
   const ids = filtered.map(p => p.id);
-  if (!ids.length || ids.length > 10) {
-    document.getElementById('err').textContent = 'Use os filtros ou a busca para deixar entre 1 e 10 presets.';
+  if (!ids.length || ids.length > 4) {
+    document.getElementById('err').textContent = 'O Katana-50 tem quatro memórias: filtre entre 1 e 4 presets.';
     return;
   }
   const names = filtered.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
-  if (!confirm(`Preparar ${ids.length} presets para troca atômica?\n\nIsso sobrescreve os slots internos correspondentes do Katana:\n\n${names}`)) return;
+  if (!confirm(`Preparar ${ids.length} presets para troca atômica?\n\nIsso sobrescreve A/CH1, A/CH2, B/CH1 e B/CH2, nessa ordem:\n\n${names}`)) return;
   livePreparing = true;
   updateLiveButton();
   document.getElementById('err').textContent = '';
@@ -660,7 +664,7 @@ function renderGrid() {
     const liveSlot = liveSlots.has(p.id) ? liveSlots.get(p.id) : null;
     const ready = liveSlot !== null ? ' live-ready' : '';
     const tags = [];
-    if (liveSlot !== null) tags.push(`<span class="tag live-slot">LIVE · ${liveSlot + 1}</span>`);
+    if (liveSlot !== null) tags.push(`<span class="tag live-slot">LIVE · ${liveSlotLabel(liveSlot)}</span>`);
     if (p.tuning) tags.push(`<span class="tag tuning">${esc(p.tuning)}</span>`);
     if (p.ampName) tags.push(`<span class="tag amp">${esc(p.ampName)}</span>`);
     if (p.artist && p.artist !== 'Outros') tags.push(`<span class="tag">${esc(p.artist)}</span>`);
@@ -759,7 +763,7 @@ async function loadPreset(id, existingGen = null) {
         current.presetId = j.id || send;
         current.name = j.name || send;
         document.getElementById('msg').textContent = j.atomic
-          ? `LIVE · slot ${j.live_slot + 1} · ${ms}ms`
+          ? `LIVE · ${liveSlotLabel(j.live_slot)} · ${ms}ms`
           : j.warning
           ? `preset aplicado · sem confirmação · ${ms}ms`
           : `preset ok · ${ms}ms`;

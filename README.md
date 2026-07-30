@@ -77,12 +77,14 @@ Requires BT-DUAL already bonded and in **KATANA 3 MIDI** mode. Pitch shifter typ
 ## Live mode (atomic preset switching)
 
 Direct `.tsl` loads can write around 80 blocks and sound progressive while the
-DSP updates. In the UI, filter/search down to 1–10 presets and click **Preparar
-Live**. This overwrites the corresponding internal Katana user slots, waits for
-the `PATCH_WRITE` acknowledgement, verifies the readable COM/AMP/SW blocks, and
+DSP updates. On the KATANA-50 Gen 3, filter/search down to 1–4 presets
+and click **Preparar Live**. This overwrites A/CH1, A/CH2, B/CH1 and
+B/CH2 (the model's four real tone memories), waits for the `PATCH_WRITE`
+acknowledgement, verifies the readable COM/AMP/SW blocks, and
 saves a local hash manifest in `.katana-live.json`.
 
-Prepared cards show `LIVE · N`. Their normal click/arrow load path sends one
+Prepared cards show their physical memory (`LIVE · A · CH1`, etc.). Their
+normal click/arrow load path sends one
 `PATCH_SELECT` command instead of rebuilding the temporary patch. Editing a
 preset invalidates its prepared hash; run **Preparar Live** again. Unprepared or
 stale presets automatically fall back to the regular loader. Preparation uses a

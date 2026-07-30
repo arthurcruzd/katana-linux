@@ -21,6 +21,10 @@ from katana_ble import ADDR, AMP_FIELDS, KatanaBLE
 ROOT = Path(__file__).resolve().parent
 PRESETS = ROOT / "presets"
 LIVE_STATE = ROOT / ".katana-live.json"
+# KATANA-50 Gen 3 uses the fixed global patch table, but only these
+# channel positions exist: A/CH1, A/CH2, B/CH1, B/CH2.
+LIVE_PATCH_SLOTS = (1, 2, 5, 6)
+LIVE_SLOT_LABELS = {1: "A · CH1", 2: "A · CH2", 5: "B · CH1", 6: "B · CH2"}
 
 # _ops_lock serializes BLE I/O only (short holds)
 # _connect_lock prevents parallel connect attempts
@@ -168,7 +172,7 @@ class AmpIn(BaseModel):
 
 
 class LivePrepareIn(BaseModel):
-    preset_ids: list[str] = Field(..., min_length=1, max_length=10)
+    preset_ids: list[str] = Field(..., min_length=1, max_length=4)
 
 
 class PresetPatchIn(BaseModel):
@@ -224,7 +228,7 @@ def _valid_live_entry(preset_id: str, path: Path) -> dict | None:
     if not entry or entry.get("digest") != _preset_digest(path):
         return None
     slot = int(entry.get("slot", -1))
-    return entry if 0 <= slot < 10 else None
+    return entry if slot in LIVE_PATCH_SLOTS else None
 
 
 _load_live_slots()
@@ -435,7 +439,8 @@ async def live_status():
     for preset_id, entry in _live_slots.items():
         path = PRESETS / preset_id
         if path.exists() and _valid_live_entry(preset_id, path):
-            valid.append({"id": preset_id, "slot": int(entry["slot"])})
+            slot = int(entry["slot"])
+            valid.append({"id": preset_id, "slot": slot, "label": LIVE_SLOT_LABELS[slot]})
     return {"ready": bool(valid), "slots": sorted(valid, key=lambda x: x["slot"])}
 
 
@@ -458,7 +463,7 @@ async def prepare_live(body: LivePrepareIn):
         _state["busy"] = "preparing-live"
         new_slots: dict[str, dict] = {}
         try:
-            for slot, (preset_id, path, preset) in enumerate(prepared):
+            for slot, (preset_id, path, preset) in zip(LIVE_PATCH_SLOTS, prepared):
                 await k.apply_preset(preset, volume_cap=50)
                 await k.write_current_patch_to_slot(slot)
                 await asyncio.sleep(0.55)
@@ -475,7 +480,7 @@ async def prepare_live(body: LivePrepareIn):
             _live_slots.clear()
             _live_slots.update(new_slots)
             _save_live_slots()
-            await k.select_patch(0)
+            await k.select_patch(LIVE_PATCH_SLOTS[0])
             first_id, _, first = prepared[0]
             _state["active_preset"] = first_id
             _state["name"] = first.get("name") or first_id
@@ -486,7 +491,12 @@ async def prepare_live(body: LivePrepareIn):
                 "prepared": len(new_slots),
                 "active": first_id,
                 "slots": [
-                    {"id": preset_id, "slot": entry["slot"], "name": entry["name"]}
+                    {
+                        "id": preset_id,
+                        "slot": entry["slot"],
+                        "label": LIVE_SLOT_LABELS[entry["slot"]],
+                        "name": entry["name"],
+                    }
                     for preset_id, entry in new_slots.items()
                 ],
             }
