@@ -167,17 +167,7 @@ class KatanaBLE:
         self.sysex.clear()
         self._buf = bytearray()
 
-        try:
-            props = await self._call(
-                self.dev, "org.freedesktop.DBus.Properties", "Get", "ss",
-                ["org.bluez.Device1", "Connected"],
-            )
-            if not props[0].value:
-                await self._call(self.dev, "org.bluez.Device1", "Connect")
-                await asyncio.sleep(1.8)
-        except RuntimeError:
-            await self._call(self.dev, "org.bluez.Device1", "Connect")
-            await asyncio.sleep(1.8)
+        await self._ensure_connected(retries=5)
 
         for _ in range(40):
             objs = await self._call(
@@ -198,11 +188,15 @@ class KatanaBLE:
             await asyncio.sleep(0.25)
         if not self.io_path:
             raise RuntimeError(
-                "BLE-MIDI char not found. Amp in MIDI mode? LED solid? Phone disconnected?"
+                "BLE-MIDI char not found. Amp in MIDI mode (nome KATANA 3 MIDI)? "
+                "LED sólido? Celular desconectado?"
             )
 
         await self._call(
-            "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "AddMatch",
+            "s",
             [
                 "type='signal',interface='org.freedesktop.DBus.Properties',"
                 f"member='PropertiesChanged',path='{self.io_path}'"
@@ -225,30 +219,108 @@ class KatanaBLE:
 
         self.bus.add_message_handler(handler)
 
-        # Restart notify cleanly (stale CCCD kills SysEx replies)
         try:
             await self._call(self.io_path, "org.bluez.GattCharacteristic1", "StopNotify")
         except Exception:
             pass
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.12)
         await self._call(self.io_path, "org.bluez.GattCharacteristic1", "StartNotify")
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.35)
 
-        # Probe that SysEx path is alive
         try:
             await self.request(ADDR["com"], 0x10, timeout=3.0)
         except TimeoutError:
-            # one automatic hard retry
             if not force:
                 await self.disconnect(drop_link=True)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(1.2)
                 await self.connect(force=True)
                 return
             raise TimeoutError(
-                "conectado no Bluetooth, mas o amp não responde SysEx. "
-                "Segure o botão do BT-DUAL até piscar (modo MIDI), "
-                "feche o app do celular e tente Conectar de novo."
+                "Bluetooth ok, mas o amp não responde SysEx. "
+                "Segure o BT-DUAL até piscar (MIDI), feche o app do celular e Conectar de novo."
             ) from None
+
+    async def _is_connected(self) -> bool:
+        try:
+            props = await self._call(
+                self.dev,
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                "ss",
+                ["org.bluez.Device1", "Connected"],
+            )
+            return bool(props[0].value)
+        except Exception:
+            return False
+
+    async def _ble_scan_pulse(self, seconds: float = 2.5) -> None:
+        """Short LE discovery so BlueZ refreshes the peripheral advertisement."""
+        adapter = "/org/bluez/hci0"
+        try:
+            await self._call(
+                adapter,
+                "org.bluez.Adapter1",
+                "SetDiscoveryFilter",
+                "a{sv}",
+                [{"Transport": Variant("s", "le"), "DuplicateData": Variant("b", True)}],
+            )
+        except Exception:
+            pass
+        try:
+            await self._call(adapter, "org.bluez.Adapter1", "StartDiscovery")
+        except Exception:
+            pass
+        await asyncio.sleep(seconds)
+        try:
+            await self._call(adapter, "org.bluez.Adapter1", "StopDiscovery")
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
+    async def _ensure_connected(self, retries: int = 5) -> None:
+        if await self._is_connected():
+            return
+
+        last_err: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                try:
+                    await self._call(self.dev, "org.bluez.Device1", "Disconnect")
+                except Exception:
+                    pass
+                await asyncio.sleep(0.6 + 0.3 * attempt)
+
+                await self._ble_scan_pulse(2.0 if attempt == 1 else 2.8)
+
+                await self._call(self.dev, "org.bluez.Device1", "Connect")
+                for _ in range(25):
+                    if await self._is_connected():
+                        await asyncio.sleep(0.8)
+                        return
+                    await asyncio.sleep(0.2)
+                last_err = RuntimeError("Connect returned but device stayed disconnected")
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                if any(
+                    s in msg
+                    for s in (
+                        "abort-by-local",
+                        "inprogress",
+                        "in progress",
+                        "le-connection",
+                        "br-connection",
+                        "busy",
+                    )
+                ):
+                    await asyncio.sleep(1.0 * attempt)
+                    continue
+                await asyncio.sleep(0.8 * attempt)
+
+        raise RuntimeError(
+            f"falha ao conectar no BT-DUAL após {retries} tentativas: {last_err}. "
+            "Confira: luz piscando/sólida em MIDI, app do celular fechado, amp ligado."
+        ) from last_err
 
     async def hard_reset_link(self) -> None:
         """Drop BlueZ ACL link so the next Connect is fresh."""
@@ -259,7 +331,11 @@ class KatanaBLE:
                 await self._call(self.dev, "org.bluez.Device1", "Disconnect")
             except Exception:
                 pass
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.5)
+            try:
+                await self._call("/org/bluez/hci0", "org.bluez.Adapter1", "StopDiscovery")
+            except Exception:
+                pass
         except Exception:
             pass
         self.io_path = None
