@@ -82,6 +82,9 @@ so autosave does not alter the preset library during the test.
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python tools/browser_stress.py
 
+# State-machine regressions (no amp required)
+.venv/bin/python tools/test_state_machine.py
+
 # Longer API-level normal-use simulation (non-destructive by default)
 .venv/bin/python tools/sim_usage.py --skip-connect
 ```

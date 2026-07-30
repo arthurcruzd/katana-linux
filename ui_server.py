@@ -25,6 +25,7 @@ PRESETS = ROOT / "presets"
 _ops_lock = asyncio.Lock()
 _connect_lock = asyncio.Lock()
 _katana: KatanaBLE | None = None
+_connect_task: asyncio.Task | None = None
 _state = {
     "connected": False,
     "pitch": -1,
@@ -79,7 +80,17 @@ async def _connect_ble(*, force: bool = False, timeout: float = 25.0) -> KatanaB
 
 
 async def with_ops(fn, *, wait_busy: float = 10.0, require_conn: bool = True):
-    """Run fn(k) holding ops lock briefly. Does not connect (unless require_conn=False)."""
+    """Run one BLE operation; commands arriving during connect wait for it."""
+    if require_conn and (not _state.get("connected") or _katana is None):
+        task = _connect_task
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=70.0)
+            except asyncio.TimeoutError as e:
+                raise HTTPException(504, "conexão ainda não terminou") from e
+            except Exception as e:
+                raise HTTPException(500, f"conexão falhou: {e}") from e
+
     deadline = asyncio.get_event_loop().time() + wait_busy
     while True:
         remaining = deadline - asyncio.get_event_loop().time()
@@ -105,10 +116,15 @@ async def with_ops(fn, *, wait_busy: float = 10.0, require_conn: bool = True):
         raise
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
-        # transport death
-        if "Timeout" in type(e).__name__ or "DT1" in str(e) or "Connect" in str(e):
-            _state["connected"] = False
-            _state["error"] = err
+        # A failed readback does not mean writes/link are dead. Ask BlueZ.
+        link_up = False
+        if _katana is not None:
+            try:
+                link_up = await _katana._is_connected()
+            except Exception:
+                pass
+        _state["connected"] = bool(link_up)
+        _state["error"] = "" if link_up else err
         raise HTTPException(500, err) from e
     finally:
         _ops_lock.release()
@@ -197,66 +213,70 @@ async def status():
     try:
         return await with_ops(_do, wait_busy=2.5)
     except HTTPException as he:
+        # Readback can time out while the BlueZ link and writes remain healthy.
+        if _state.get("connected") and _katana is not None:
+            return JSONResponse(
+                {
+                    "connected": True,
+                    "name": _state.get("name") or "",
+                    "pitch": _state.get("pitch", 0),
+                    "amp": None,
+                    "sw": None,
+                    "error": "",
+                    "warning": str(he.detail),
+                    "busy": _state.get("busy") or "",
+                }
+            )
         return JSONResponse(_snap_disconnected(str(he.detail)))
 
 
-@app.post("/api/connect")
-async def connect():
+async def _run_connect() -> dict:
+    """One durable connect attempt shared by every HTTP caller."""
     global _katana
-    # Wait if another connect is running
-    if _connect_lock.locked():
-        for _ in range(50):
-            if not _connect_lock.locked():
-                break
-            await asyncio.sleep(0.15)
-        if _connect_lock.locked():
-            raise HTTPException(409, "já conectando")
-
     async with _connect_lock:
+        # An initialized link is enough. A readback timeout is only a warning.
         if _state.get("connected") and _katana is not None:
-            # already up — just ping
             try:
-                async def _ping(k):
-                    return await k.read_status_light()
-
-                p = await with_ops(_ping, wait_busy=3.0)
-                return {
-                    "ok": True,
-                    "connected": True,
-                    "pitch": _state.get("pitch"),
-                    "name": p.get("name"),
-                }
+                if await _katana._is_connected():
+                    return {
+                        "ok": True,
+                        "connected": True,
+                        "pitch": _state.get("pitch"),
+                        "name": _state.get("name") or "",
+                    }
             except Exception:
-                _state["connected"] = False
+                pass
+            _state["connected"] = False
 
         _state["busy"] = "connecting"
         _state["error"] = ""
         try:
-            # BLE connect OUTSIDE ops lock so amp/pitch aren't blocked for 30s
             try:
-                k = await _connect_ble(force=False, timeout=18.0)
+                k = await _connect_ble(force=False, timeout=20.0)
             except Exception as soft_err:
                 _state["error"] = f"soft: {soft_err}"
-                k = await _connect_ble(force=True, timeout=30.0)
+                k = await _connect_ble(force=True, timeout=35.0)
 
-            # install under ops lock briefly
             async with _ops_lock:
                 _katana = k
                 _state["connected"] = True
                 _state["pitch_armed"] = False
                 pitch = int(_state.get("pitch", -1) or -1)
                 try:
-                    await asyncio.wait_for(ensure_pitch_mod(k, pitch, full=True), timeout=6.0)
+                    await asyncio.wait_for(
+                        ensure_pitch_mod(k, pitch, full=True), timeout=6.0
+                    )
                 except Exception:
                     pass
-                name = ""
+                name = _state.get("name") or ""
                 try:
                     p = await asyncio.wait_for(k.read_status_light(), timeout=3.5)
-                    name = p.get("name") or ""
+                    name = p.get("name") or name
                     _state["name"] = name
                     if p.get("pitch") is not None:
                         _state["pitch"] = p["pitch"]
                 except Exception:
+                    # Readback is optional; the link/notify setup succeeded.
                     pass
                 _state["error"] = ""
                 return {
@@ -269,9 +289,27 @@ async def connect():
             _state["connected"] = False
             _state["pitch_armed"] = False
             _state["error"] = f"{type(e).__name__}: {e}"
-            raise HTTPException(500, _state["error"]) from e
+            raise RuntimeError(_state["error"]) from e
         finally:
             _state["busy"] = ""
+
+
+@app.post("/api/connect")
+async def connect():
+    global _connect_task
+    # Concurrent clicks/tabs await the SAME attempt; no 409 and no orphan connect.
+    if _connect_task is None or _connect_task.done():
+        _connect_task = asyncio.create_task(_run_connect())
+    task = _connect_task
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=70.0)
+    except asyncio.TimeoutError as e:
+        raise HTTPException(504, "conexão ainda em andamento — aguarde") from e
+    except Exception as e:
+        raise HTTPException(500, str(e)) from e
+    finally:
+        if task.done() and _connect_task is task:
+            _connect_task = None
 
 
 @app.post("/api/pitch")
@@ -348,26 +386,40 @@ async def load_preset(preset_id: str):
             preset = json.loads(path.read_text())
             _state["pitch_armed"] = False
             await k.apply_preset(preset, volume_cap=50)
-            # light readback
+            # Writes completed: readback is diagnostic, never grounds for failure.
+            p = {
+                "name": preset.get("name") or path.stem,
+                "amp": preset.get("amp") or {},
+            }
+            readback_ok = False
+            warning = ""
             try:
-                p = await k.read_status_light()
-            except Exception:
-                p = await k.read_patch()
+                live = await k.read_status_light()
+                if live:
+                    p = live
+                    readback_ok = True
+            except Exception as e:
+                warning = f"preset aplicado; leitura de confirmação indisponível: {e}"
             try:
                 d = await k.request(0x20001C48, 12, timeout=1.5)
                 _state["pitch"] = d[2] - 24
             except Exception:
-                pass
+                fx = preset.get("fx") or {}
+                if fx.get("pitch_semitones") is not None:
+                    _state["pitch"] = int(fx["pitch_semitones"])
             _state["name"] = p.get("name") or preset.get("name") or ""
             _state["active_preset"] = preset_id
+            _state["connected"] = True
             return {
                 "ok": True,
                 "id": preset_id,
-                "name": p.get("name"),
+                "name": p.get("name") or preset.get("name"),
                 "pitch": _state.get("pitch"),
-                "amp": p.get("amp"),
+                "amp": p.get("amp") or preset.get("amp") or {},
                 "full": bool(preset.get("raw_blocks")),
                 "chain": (preset.get("chain") or {}).get("label"),
+                "readback_ok": readback_ok,
+                "warning": warning,
             }
         finally:
             if _state.get("busy") == "loading":

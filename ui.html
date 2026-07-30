@@ -690,7 +690,9 @@ async function loadPreset(id, existingGen = null) {
         const ms = Math.round(performance.now() - t0);
         current.presetId = j.id || send;
         current.name = j.name || send;
-        document.getElementById('msg').textContent = `preset ok · ${ms}ms`;
+        document.getElementById('msg').textContent = j.warning
+          ? `preset aplicado · sem confirmação · ${ms}ms`
+          : `preset ok · ${ms}ms`;
         document.getElementById('npName').textContent = j.name || send;
         const meta = presets.find(p => p.id === send);
         document.getElementById('npSong').textContent = meta?.song || '';
@@ -932,17 +934,18 @@ async function refresh() {
     const r = await fetch('/api/status');
     const j = await r.json();
     setConn(!!j.connected, j.error || '');
+    if (j.warning) document.getElementById('msg').textContent = 'conectado · leitura pendente';
     if (j.connected) updateNowPlaying(j);
   } catch (e) {
     setConn(false, String(e));
   }
 }
 async function connect() {
-  document.getElementById('msg').textContent = 'conectando (até ~40s)…';
+  document.getElementById('msg').textContent = 'conectando (pode levar até ~65s)…';
   document.getElementById('err').textContent = '';
   document.getElementById('btnConnect').disabled = true;
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), 45000);
+  const t = setTimeout(() => ac.abort(), 70000);
   try {
     const r = await fetch('/api/connect', { method: 'POST', signal: ac.signal });
     const j = await r.json();
@@ -951,7 +954,7 @@ async function connect() {
     await refresh();
   } catch (e) {
     const msg = e.name === 'AbortError'
-      ? 'timeout — confira o BT-DUAL (MIDI) e tente de novo'
+      ? 'timeout — a tentativa continua no servidor; aguarde e clique Atualizar'
       : String(e.message || e);
     setConn(false, msg);
     document.getElementById('msg').textContent = '';
