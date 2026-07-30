@@ -369,6 +369,53 @@ let volTimer = null;
 let pitchTimer = null;
 let pitchInflight = false;
 let pitchQueued = null;
+let saveTimer = null;
+
+function schedulePresetSave(reason) {
+  if (!current.presetId) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => persistPreset(reason), 450);
+}
+
+async function persistPreset(reason) {
+  if (!current.presetId) return;
+  const amp = { ...(current.amp || {}) };
+  // live slider values win
+  amp.volume = current.volume;
+  if (document.getElementById('av_gain')) amp.gain = +document.getElementById('av_gain').textContent;
+  if (document.getElementById('av_bass')) amp.bass = +document.getElementById('av_bass').textContent;
+  if (document.getElementById('av_middle')) amp.middle = +document.getElementById('av_middle').textContent;
+  if (document.getElementById('av_treble')) amp.treble = +document.getElementById('av_treble').textContent;
+  if (document.getElementById('av_presence')) amp.presence = +document.getElementById('av_presence').textContent;
+  // strip non-serializable
+  const cleanAmp = {};
+  for (const [k, v] of Object.entries(amp)) {
+    if (v === undefined || v === null || k === 'raw') continue;
+    cleanAmp[k] = typeof v === 'number' ? v : v;
+  }
+  try {
+    const r = await fetch('/api/presets/' + encodeURIComponent(current.presetId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        amp: cleanAmp,
+        pitch_semitones: current.pitch,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(fmtErr(j));
+    // keep library list in sync
+    const p = presets.find(x => x.id === current.presetId);
+    if (p) {
+      p.amp = { ...(p.amp || {}), ...cleanAmp };
+      p.hay = [p.name, p.song, p.tuning, p.notes, p.id, p.artist, p.ampName].join(' ').toLowerCase();
+    }
+    const label = reason || 'preset';
+    document.getElementById('msg').textContent = `salvo · ${label}`;
+  } catch (e) {
+    document.getElementById('err').textContent = 'salvar preset: ' + (e.message || e);
+  }
+}
 
 function openTo(semi) {
   return NOTE[(4 + (+semi) + 120) % 12];
@@ -586,6 +633,7 @@ async function loadPreset(id) {
         const ms = Math.round(performance.now() - t0);
         current.presetId = send;
         current.name = j.name || send;
+        if (j.id) current.presetId = j.id;
         document.getElementById('msg').textContent = `preset ok · ${ms}ms`;
         document.getElementById('npName').textContent = j.name || send;
         const meta = presets.find(p => p.id === send);
@@ -633,6 +681,7 @@ async function setVol(v) {
   document.getElementById('vol').value = v;
   document.getElementById('volVal').textContent = v;
   current.volume = v;
+  if (current.amp) current.amp.volume = v;
   try {
     const r = await fetch('/api/amp', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -642,6 +691,7 @@ async function setVol(v) {
     if (!r.ok) throw new Error(fmtErr(j));
     setConn(true);
     document.getElementById('msg').textContent = `vol ${v}`;
+    schedulePresetSave('volume');
   } catch (e) {
     document.getElementById('err').textContent = String(e.message || e);
   }
@@ -678,6 +728,7 @@ async function setPitch(v) {
       const ms = Math.round(performance.now() - t0);
       document.getElementById('msg').textContent = `tom ${fmtPitch(j.pitch)} · ${ms}ms`;
       setConn(true);
+      schedulePresetSave('pitch');
       if (pitchQueued === null) break;
       v = pitchQueued;
     }
@@ -716,7 +767,11 @@ async function setAmp(field, value) {
     });
     const j = await r.json();
     if (!r.ok) throw new Error(fmtErr(j));
+    if (!current.amp) current.amp = {};
+    current.amp[field] = +value;
+    if (field === 'volume') current.volume = +value;
     setConn(true);
+    schedulePresetSave(field);
   } catch (e) {
     document.getElementById('err').textContent = String(e.message || e);
   }

@@ -122,6 +122,13 @@ class AmpIn(BaseModel):
     value: int = Field(..., ge=0, le=120)
 
 
+class PresetPatchIn(BaseModel):
+    """Partial update written back to the preset JSON on disk."""
+    amp: dict[str, int | str | float | None] | None = None
+    pitch_semitones: int | None = Field(default=None, ge=-24, le=24)
+    sw: dict[str, int] | None = None
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = ROOT / "ui.html"
@@ -258,8 +265,10 @@ async def load_preset(preset_id: str):
         except Exception:
             pass
         _state["connected"] = True
+        _state["active_preset"] = preset_id
         return {
             "ok": True,
+            "id": preset_id,
             "name": p.get("name"),
             "pitch": _state["pitch"],
             "amp": p.get("amp"),
@@ -267,6 +276,55 @@ async def load_preset(preset_id: str):
 
     return await with_k(_do)
 
+
+@app.patch("/api/presets/{preset_id:path}")
+async def patch_preset(preset_id: str, body: PresetPatchIn):
+    """Persist slider tweaks into the preset file (volume, EQ, pitch…)."""
+    # prevent path traversal
+    path = (PRESETS / preset_id).resolve()
+    if not str(path).startswith(str(PRESETS.resolve())) or path.suffix != ".json":
+        raise HTTPException(400, "invalid preset id")
+    if not path.exists():
+        raise HTTPException(404, "preset not found")
+
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        raise HTTPException(500, f"cannot read preset: {e}") from e
+
+    if body.amp:
+        amp = data.setdefault("amp", {})
+        for k, v in body.amp.items():
+            if v is None:
+                continue
+            if k in ("type_name",):
+                amp[k] = str(v)
+            else:
+                try:
+                    amp[k] = int(v)
+                except (TypeError, ValueError):
+                    continue
+
+    if body.sw:
+        sw = data.setdefault("sw", {})
+        for k, v in body.sw.items():
+            sw[k] = int(v)
+
+    if body.pitch_semitones is not None:
+        fx = data.setdefault("fx", {})
+        fx["pitch_semitones"] = int(body.pitch_semitones)
+        # keep type as pitch shifter if present
+        fx.setdefault("type", 11)
+        fx.setdefault("type_name", "pitch_shifter")
+
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    _state["active_preset"] = preset_id
+    return {
+        "ok": True,
+        "id": preset_id,
+        "amp": data.get("amp"),
+        "pitch_semitones": (data.get("fx") or {}).get("pitch_semitones"),
+    }
 
 
 def main():
