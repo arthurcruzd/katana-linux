@@ -77,8 +77,15 @@ async def get_k(*, force: bool = False, connect_timeout: float = 35.0) -> Katana
     return _katana
 
 
-async def with_k(fn, *, retry: bool = True, lock_timeout: float = 40.0, wait_busy: float = 12.0):
-    """Run fn(k). Wait for lock (up to wait_busy) so rapid clicks don't fail."""
+async def with_k(
+    fn,
+    *,
+    retry: bool = True,
+    lock_timeout: float = 40.0,
+    wait_busy: float = 12.0,
+    auto_connect: bool = True,
+):
+    """Run fn(k). Wait for lock so rapid clicks queue instead of failing."""
     deadline = asyncio.get_event_loop().time() + wait_busy
     while True:
         remaining = deadline - asyncio.get_event_loop().time()
@@ -88,26 +95,32 @@ async def with_k(fn, *, retry: bool = True, lock_timeout: float = 40.0, wait_bus
                 f"ocupado ({_state.get('busy') or 'ble'}) — tente de novo em 1s",
             )
         try:
-            await asyncio.wait_for(_lock.acquire(), timeout=min(lock_timeout, max(0.2, remaining)))
+            await asyncio.wait_for(
+                _lock.acquire(), timeout=min(lock_timeout, max(0.15, remaining))
+            )
             break
         except asyncio.TimeoutError:
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.05)
             continue
     try:
         try:
-            if not _state.get("connected") or _katana is None:
-                k = await get_k(connect_timeout=25.0)
-            else:
+            if _state.get("connected") and _katana is not None:
                 k = _katana
+            elif auto_connect:
+                k = await get_k(connect_timeout=20.0)
+            else:
+                raise HTTPException(400, "não conectado — clique em Conectar")
             return await fn(k)
+        except HTTPException:
+            raise
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             _state["error"] = err
             _state["connected"] = False
-            if not retry:
+            if not retry or not auto_connect:
                 raise HTTPException(500, err) from e
             try:
-                k = await get_k(force=True, connect_timeout=30.0)
+                k = await get_k(force=True, connect_timeout=25.0)
                 return await fn(k)
             except Exception as e2:
                 _state["connected"] = False
@@ -292,7 +305,7 @@ async def set_pitch(body: PitchIn):
         _state["connected"] = True
         return {"ok": True, "pitch": rb, "requested": body.semitones}
 
-    return await with_k(_do, wait_busy=8.0, lock_timeout=2.0)
+    return await with_k(_do, wait_busy=8.0, lock_timeout=2.0, auto_connect=False, retry=False)
 
 
 @app.post("/api/amp")
@@ -306,7 +319,7 @@ async def set_amp(body: AmpIn):
         _state["connected"] = True
         return {"ok": True, "field": body.field, "value": body.value}
 
-    return await with_k(_do, wait_busy=8.0, lock_timeout=2.0)
+    return await with_k(_do, wait_busy=8.0, lock_timeout=2.0, auto_connect=False, retry=False)
 
 
 @app.get("/api/presets")
