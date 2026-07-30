@@ -1,0 +1,64 @@
+{
+  "name": "NEM Solo",
+  "notes": "Metallica — Nothing Else Matters solo. Singing lead: moderate gain, warm mids, long delay trails + hall reverb. Volume kept modest. Neck-ish feel; dig in for the high bends.",
+  "song": "Metallica - Nothing Else Matters (solo)",
+  "tuning": "E standard",
+  "amp": {
+    "gain": 52,
+    "volume": 38,
+    "bass": 52,
+    "middle": 64,
+    "treble": 58,
+    "presence": 50,
+    "poweramp_variation": 0,
+    "type": 4,
+    "type_name": "lead",
+    "resonance": 50,
+    "preamp_variation": 1
+  },
+  "sw": {
+    "booster": 0,
+    "mod": 0,
+    "fx": 0,
+    "delay": 1,
+    "delay2": 0,
+    "reverb": 1
+  },
+  "booster": {
+    "type": 11,
+    "type_name": "t_scream",
+    "drive": 30,
+    "bottom": 0,
+    "tone": 0,
+    "solo_sw": 0,
+    "solo_level": 50,
+    "effect_level": 40,
+    "direct_mix": 0
+  },
+  "delay": {
+    "type": 0,
+    "type_name": "digital",
+    "time_ms": 480,
+    "feedback": 32,
+    "high_cut": 9,
+    "effect_level": 42,
+    "direct_level": 100,
+    "tap_time": 50,
+    "mod_rate": 35,
+    "mod_depth": 30,
+    "lpf": 1
+  },
+  "reverb": {
+    "type": 2,
+    "type_name": "hall",
+    "layer_mode": 2,
+    "time": 55,
+    "pre_delay_ms": 40,
+    "low_cut": 14,
+    "high_cut": 8,
+    "density": 9,
+    "effect_level": 40,
+    "direct_level": 100,
+    "spring_color": 100
+  }
+}
