@@ -392,22 +392,27 @@ class KatanaBLE:
         fx = preset.get("fx")
         if fx:
             ftype = int(fx.get("type", FX_PITCH_SHIFTER))
-            await self.write_bytes(ADDR["fx"], [ftype & 0x7F])
-            # pitch shifter shortcut
+            # MOD uses FX(1..3); panel FX uses FX(4..6). Pitch detail UI binds to FX_DETAIL(1).
+            # Write type to all three MOD variations so color select can't miss.
+            for rel in (0x1000, 0x1200, 0x1400):
+                await self.write_bytes(0x20000000 + rel, [ftype & 0x7F])
             if ftype == FX_PITCH_SHIFTER or fx.get("pitch_semitones") is not None:
-                pitch = int(fx.get("pitch_semitones", -1))
-                pitch = max(-24, min(24, pitch))
-                mode = int(fx.get("mode", 3))  # 3 ~ mono (good for lead)
+                pitch = max(-24, min(24, int(fx.get("pitch_semitones", -1))))
+                mode = int(fx.get("mode", 1))  # Fast/Medium often better for poly than mono
                 level = int(fx.get("level", 100))
-                direct = int(fx.get("direct_mix", 0))  # 0 = fully transposed
-                base = ADDR["fx_detail"]
-                await self.write_bytes(base + PS_VOICE, [0])  # 1 voice
-                await self.write_bytes(base + PS_MODE1, [mode & 0x7F])
-                await self.write_bytes(base + PS_PITCH1, [(pitch + 24) & 0x7F])
-                await self.write_bytes(base + PS_FINE1, [50])  # fine 0
-                await self.write_bytes(base + PS_PREDELAY1, enc_4x4(0))
-                await self.write_bytes(base + PS_LEVEL1, [level & 0x7F])
-                await self.write_bytes(base + PS_DIRECT_MIX, [direct & 0x7F])
+                direct = int(fx.get("direct_mix", 0))
+                # FX_DETAIL(1..3) for the three MOD colors
+                for det in (0x1C00, 0x1E00, 0x2000):
+                    base = 0x20000000 + det
+                    await self.write_bytes(base + PS_VOICE, [0])
+                    await self.write_bytes(base + PS_MODE1, [mode & 0x7F])
+                    await self.write_bytes(base + PS_PITCH1, [(pitch + 24) & 0x7F])
+                    await self.write_bytes(base + PS_FINE1, [50])
+                    await self.write_bytes(base + PS_PREDELAY1, enc_4x4(0))
+                    await self.write_bytes(base + PS_LEVEL1, [level & 0x7F])
+                    await self.write_bytes(base + PS_DIRECT_MIX, [direct & 0x7F])
+            # Ensure MOD color variation is 0 (green / FX1)
+            await self.write_bytes(0x20000400 + 0x01, [0])  # PATCH_COLOR MOD_COLOR if layout matches
 
         await asyncio.sleep(0.3)
 
