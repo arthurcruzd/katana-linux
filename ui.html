@@ -394,7 +394,7 @@ async function persistPreset(reason) {
     cleanAmp[k] = typeof v === 'number' ? v : v;
   }
   try {
-    const r = await fetch('/api/presets/' + encodeURIComponent(current.presetId), {
+    const j = await apiJSON('/api/presets/' + encodeURIComponent(current.presetId), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -402,8 +402,6 @@ async function persistPreset(reason) {
         pitch_semitones: current.pitch,
       }),
     });
-    const j = await r.json();
-    if (!r.ok) throw new Error(fmtErr(j));
     // keep library list in sync
     const p = presets.find(x => x.id === current.presetId);
     if (p) {
@@ -433,6 +431,33 @@ function fmtErr(j) {
   if (typeof j.detail === 'string') return j.detail;
   if (Array.isArray(j.detail)) return j.detail.map(x => x.msg || JSON.stringify(x)).join('; ');
   return j.error || JSON.stringify(j);
+}
+
+/** fetch JSON with silent retry on 503 (BLE busy) */
+async function apiJSON(url, opts = {}, { retries = 6 } = {}) {
+  let lastErr;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const r = await fetch(url, opts);
+      const j = await r.json().catch(() => ({}));
+      if (r.status === 503) {
+        lastErr = new Error(fmtErr(j) || 'ocupado');
+        await new Promise(res => setTimeout(res, 120 + i * 80));
+        continue;
+      }
+      if (!r.ok) throw new Error(fmtErr(j) || r.statusText);
+      return j;
+    } catch (e) {
+      lastErr = e;
+      // network blip
+      if (i + 1 < retries && !(e.message || '').includes('ocupado')) {
+        await new Promise(res => setTimeout(res, 80));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr || new Error('falha de rede');
 }
 function setConn(on, err) {
   document.getElementById('dot').className = 'dot ' + (on ? 'on' : 'off');
@@ -627,9 +652,7 @@ async function loadPreset(id) {
       const t0 = performance.now();
       try {
         const url = '/api/presets/' + encodeURIComponent(send) + '/load';
-        const r = await fetch(url, { method: 'POST' });
-        const j = await r.json();
-        if (!r.ok) throw new Error(fmtErr(j));
+        const j = await apiJSON(url, { method: 'POST' }, { retries: 4 });
         const ms = Math.round(performance.now() - t0);
         current.presetId = send;
         current.name = j.name || send;
@@ -676,24 +699,35 @@ function onVolInput(v) {
   clearTimeout(volTimer);
   volTimer = setTimeout(() => setVol(+v), 30);
 }
+let volInflight = false;
+let volQueued = null;
 async function setVol(v) {
   v = Math.max(0, Math.min(100, v|0));
   document.getElementById('vol').value = v;
   document.getElementById('volVal').textContent = v;
   current.volume = v;
   if (current.amp) current.amp.volume = v;
+  if (volInflight) { volQueued = v; return; }
+  volInflight = true;
   try {
-    const r = await fetch('/api/amp', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ field: 'volume', value: v })
-    });
-    const j = await r.json();
-    if (!r.ok) throw new Error(fmtErr(j));
-    setConn(true);
-    document.getElementById('msg').textContent = `vol ${v}`;
-    schedulePresetSave('volume');
+    while (true) {
+      const send = volQueued === null ? v : volQueued;
+      volQueued = null;
+      await apiJSON('/api/amp', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field: 'volume', value: send })
+      });
+      setConn(true);
+      document.getElementById('msg').textContent = `vol ${send}`;
+      document.getElementById('err').textContent = '';
+      schedulePresetSave('volume');
+      if (volQueued === null) break;
+      v = volQueued;
+    }
   } catch (e) {
     document.getElementById('err').textContent = String(e.message || e);
+  } finally {
+    volInflight = false;
   }
 }
 function nudgeVol(delta) {
@@ -719,14 +753,13 @@ async function setPitch(v) {
       const send = pitchQueued === null ? v : pitchQueued;
       pitchQueued = null;
       const t0 = performance.now();
-      const r = await fetch('/api/pitch', {
+      const j = await apiJSON('/api/pitch', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ semitones: send })
       });
-      const j = await r.json();
-      if (!r.ok) throw new Error(fmtErr(j));
       const ms = Math.round(performance.now() - t0);
       document.getElementById('msg').textContent = `tom ${fmtPitch(j.pitch)} · ${ms}ms`;
+      document.getElementById('err').textContent = '';
       setConn(true);
       schedulePresetSave('pitch');
       if (pitchQueued === null) break;
@@ -734,7 +767,6 @@ async function setPitch(v) {
     }
   } catch (e) {
     document.getElementById('err').textContent = String(e.message || e);
-    setConn(false);
   } finally {
     pitchInflight = false;
   }
@@ -755,25 +787,40 @@ function renderAmp(amp) {
   }
 }
 const ampTimers = {};
+const ampQueued = {};
+let ampInflight = {};
 function queueAmp(field, value) {
   clearTimeout(ampTimers[field]);
   ampTimers[field] = setTimeout(() => setAmp(field, value), 40);
 }
 async function setAmp(field, value) {
+  value = +value;
+  if (ampInflight[field]) {
+    ampQueued[field] = value;
+    return;
+  }
+  ampInflight[field] = true;
   try {
-    const r = await fetch('/api/amp', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ field, value: +value })
-    });
-    const j = await r.json();
-    if (!r.ok) throw new Error(fmtErr(j));
-    if (!current.amp) current.amp = {};
-    current.amp[field] = +value;
-    if (field === 'volume') current.volume = +value;
-    setConn(true);
-    schedulePresetSave(field);
+    while (true) {
+      const send = ampQueued[field] === undefined ? value : ampQueued[field];
+      delete ampQueued[field];
+      await apiJSON('/api/amp', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field, value: send })
+      });
+      if (!current.amp) current.amp = {};
+      current.amp[field] = send;
+      if (field === 'volume') current.volume = send;
+      setConn(true);
+      document.getElementById('err').textContent = '';
+      schedulePresetSave(field);
+      if (ampQueued[field] === undefined) break;
+      value = ampQueued[field];
+    }
   } catch (e) {
     document.getElementById('err').textContent = String(e.message || e);
+  } finally {
+    ampInflight[field] = false;
   }
 }
 

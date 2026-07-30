@@ -77,18 +77,28 @@ async def get_k(*, force: bool = False, connect_timeout: float = 35.0) -> Katana
     return _katana
 
 
-async def with_k(fn, *, retry: bool = True, lock_timeout: float = 40.0):
-    """Run fn(k). Acquire lock with timeout so the UI never freezes forever."""
-    try:
-        await asyncio.wait_for(_lock.acquire(), timeout=lock_timeout)
-    except asyncio.TimeoutError as e:
-        raise HTTPException(
-            503,
-            f"ocupado ({_state.get('busy') or 'ble'}) — espere ou recarregue a página",
-        ) from e
+async def with_k(fn, *, retry: bool = True, lock_timeout: float = 40.0, wait_busy: float = 12.0):
+    """Run fn(k). Wait for lock (up to wait_busy) so rapid clicks don't fail."""
+    deadline = asyncio.get_event_loop().time() + wait_busy
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            raise HTTPException(
+                503,
+                f"ocupado ({_state.get('busy') or 'ble'}) — tente de novo em 1s",
+            )
+        try:
+            await asyncio.wait_for(_lock.acquire(), timeout=min(lock_timeout, max(0.2, remaining)))
+            break
+        except asyncio.TimeoutError:
+            await asyncio.sleep(0.08)
+            continue
     try:
         try:
-            k = await get_k(connect_timeout=25.0)
+            if not _state.get("connected") or _katana is None:
+                k = await get_k(connect_timeout=25.0)
+            else:
+                k = _katana
             return await fn(k)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -215,16 +225,22 @@ async def status():
 @app.post("/api/connect")
 async def connect():
     if _connect_lock.locked() or _state.get("busy") == "connecting":
-        raise HTTPException(409, "já conectando — aguarde alguns segundos")
+        # wait briefly instead of hard 409
+        for _ in range(40):
+            if not _connect_lock.locked() and _state.get("busy") != "connecting":
+                break
+            await asyncio.sleep(0.15)
+        if _connect_lock.locked() or _state.get("busy") == "connecting":
+            raise HTTPException(409, "já conectando — aguarde alguns segundos")
 
     async with _connect_lock:
         _state["busy"] = "connecting"
         _state["error"] = ""
         try:
             try:
-                await asyncio.wait_for(_lock.acquire(), timeout=5.0)
+                await asyncio.wait_for(_lock.acquire(), timeout=15.0)
             except asyncio.TimeoutError as e:
-                raise HTTPException(503, "BLE ocupado com outra operação") from e
+                raise HTTPException(503, "BLE ocupado — aguarde o fim da operação anterior") from e
             try:
                 _state["pitch_armed"] = False
                 # Soft connect first — force+scan often causes le-connection-abort-by-local
@@ -272,12 +288,11 @@ async def connect():
 @app.post("/api/pitch")
 async def set_pitch(body: PitchIn):
     async def _do(k: KatanaBLE):
-        # no readback — fire-and-forget for lowest latency
         rb = await ensure_pitch_mod(k, body.semitones, full=False)
         _state["connected"] = True
         return {"ok": True, "pitch": rb, "requested": body.semitones}
 
-    return await with_k(_do)
+    return await with_k(_do, wait_busy=8.0, lock_timeout=2.0)
 
 
 @app.post("/api/amp")
@@ -287,12 +302,11 @@ async def set_amp(body: AmpIn):
 
     async def _do(k: KatanaBLE):
         off = AMP_FIELDS.index(body.field)
-        # fire-and-forget write, no readback
         await k.write_bytes(ADDR["amp"] + off, [body.value & 0x7F], gap=0.0, pace=0.0)
         _state["connected"] = True
         return {"ok": True, "field": body.field, "value": body.value}
 
-    return await with_k(_do)
+    return await with_k(_do, wait_busy=8.0, lock_timeout=2.0)
 
 
 @app.get("/api/presets")
