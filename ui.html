@@ -144,7 +144,20 @@
     box-shadow: 0 0 0 1px rgba(61,214,255,.25), 0 8px 28px rgba(0,0,0,.35);
     background: linear-gradient(160deg, rgba(61,214,255,.08), var(--panel));
   }
-  .card.loading { opacity: .6; }
+  .card.live {
+    border-color: rgba(61,214,140,.55);
+  }
+  .card.live .name::after {
+    content: " · no amp";
+    color: var(--ok);
+    font-size: .75rem;
+    font-weight: 500;
+  }
+  .card.loading { opacity: .55; pointer-events: none; }
+  .card.loading::after {
+    content: "…";
+    color: var(--accent);
+  }
   .card .name { font-size: 1.05rem; font-weight: 650; line-height: 1.25; }
   .card .song { color: var(--text); font-size: .88rem; opacity: .9; }
   .card .meta {
@@ -332,9 +345,9 @@
   <footer class="foot">
     <span><kbd>↑</kbd><kbd>↓</kbd> volume</span>
     <span class="sep">·</span>
-    <span><kbd>←</kbd><kbd>→</kbd> preset</span>
+    <span><kbd>←</kbd><kbd>→</kbd> trocar preset</span>
     <span class="sep">·</span>
-    <span><kbd>Enter</kbd> carregar</span>
+    <span>clique = carregar</span>
     <span class="sep">·</span>
     <span><kbd>/</kbd> buscar</span>
     <span class="sep">·</span>
@@ -482,13 +495,12 @@ function renderGrid() {
   }
   grid.innerHTML = filtered.map(p => {
     const sel = p.id === selectedId ? 'selected' : '';
+    const live = p.id === current.presetId || p.name === current.name ? ' live' : '';
     const tags = [];
     if (p.tuning) tags.push(`<span class="tag tuning">${esc(p.tuning)}</span>`);
     if (p.ampName) tags.push(`<span class="tag amp">${esc(p.ampName)}</span>`);
     if (p.artist && p.artist !== 'Outros') tags.push(`<span class="tag">${esc(p.artist)}</span>`);
-    return `<div class="card ${sel}" data-id="${escAttr(p.id)}" tabindex="-1"
-      onclick="selectPreset('${escAttr(p.id)}')"
-      ondblclick="loadSelected()">
+    return `<div class="card ${sel}${live}" data-id="${escAttr(p.id)}" tabindex="-1">
       <div class="name">${esc(p.name)}</div>
       <div class="song">${esc(p.song || p.notes || p.id)}</div>
       <div class="meta">${tags.join('')}</div>
@@ -496,30 +508,42 @@ function renderGrid() {
   }).join('');
 }
 
+// event delegation — avoids broken inline handlers with special ids
+document.getElementById('grid').addEventListener('click', (e) => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+  const id = card.getAttribute('data-id');
+  if (!id) return;
+  selectPreset(id);
+  loadPreset(id); // single click loads
+});
+
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
 }
-function escAttr(s) { return String(s ?? '').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+function escAttr(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;');
+}
 
 function selectPreset(id) {
   selectedId = id;
   renderGrid();
   const p = presets.find(x => x.id === id);
-  if (p) showNowPlayingPreview(p);
-  // scroll selected into view
-  const el = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
+  if (p) {
+    document.getElementById('footStatus').textContent =
+      `selecionado: ${p.name}` + (p.song ? ` · ${p.song}` : '');
+  }
+  const el = document.querySelector(`.card.selected`);
   if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
 function showNowPlayingPreview(p) {
-  // only update "library selection" side details if not loaded yet — keep amp name separate
-  // We show selection info in notes area when different from loaded
-  const loaded = current.presetId === p.id;
-  if (!current.name || !loaded) {
-    // soft preview of selection without overwriting live amp name if connected
-  }
   document.getElementById('footStatus').textContent =
     `selecionado: ${p.name}` + (p.song ? ` · ${p.song}` : '');
 }
@@ -527,33 +551,76 @@ function showNowPlayingPreview(p) {
 function selectedIndex() {
   return filtered.findIndex(p => p.id === selectedId);
 }
-function moveSelection(delta) {
+function moveSelection(delta, { load = true } = {}) {
   if (!filtered.length) return;
   let i = selectedIndex();
   if (i < 0) i = 0;
   else i = (i + delta + filtered.length) % filtered.length;
   selectPreset(filtered[i].id);
+  if (load) loadPreset(filtered[i].id);
 }
 
-async function loadSelected() {
-  if (!selectedId) return;
-  const card = document.querySelector(`.card.selected`);
-  if (card) card.classList.add('loading');
-  document.getElementById('msg').textContent = 'carregando…';
-  try {
-    const r = await fetch('/api/presets/' + encodeURIComponent(selectedId) + '/load', { method: 'POST' });
-    const j = await r.json();
-    if (!r.ok) throw new Error(fmtErr(j));
-    document.getElementById('msg').textContent = 'preset ok';
-    current.presetId = selectedId;
-    setConn(true);
-    await refresh();
-  } catch (e) {
-    document.getElementById('err').textContent = String(e.message || e);
-    setConn(false);
-  } finally {
-    if (card) card.classList.remove('loading');
+let loadInflight = false;
+let loadQueued = null;
+async function loadPreset(id) {
+  if (!id) return;
+  if (loadInflight) {
+    loadQueued = id;
+    return;
   }
+  loadInflight = true;
+  try {
+    while (true) {
+      const send = loadQueued === null ? id : loadQueued;
+      loadQueued = null;
+      const card = document.querySelector(`.card[data-id="${CSS.escape(send)}"]`);
+      if (card) card.classList.add('loading');
+      document.getElementById('msg').textContent = 'carregando preset…';
+      document.getElementById('err').textContent = '';
+      const t0 = performance.now();
+      try {
+        const url = '/api/presets/' + encodeURIComponent(send) + '/load';
+        const r = await fetch(url, { method: 'POST' });
+        const j = await r.json();
+        if (!r.ok) throw new Error(fmtErr(j));
+        const ms = Math.round(performance.now() - t0);
+        current.presetId = send;
+        current.name = j.name || send;
+        document.getElementById('msg').textContent = `preset ok · ${ms}ms`;
+        document.getElementById('npName').textContent = j.name || send;
+        const meta = presets.find(p => p.id === send);
+        document.getElementById('npSong').textContent = meta?.song || '';
+        document.getElementById('npNotes').textContent = meta?.notes || meta?.tuning || '';
+        if (j.amp) {
+          current.volume = j.amp.volume ?? current.volume;
+          document.getElementById('vol').value = current.volume;
+          document.getElementById('volVal').textContent = current.volume;
+          renderAmp(j.amp);
+          current.amp = j.amp;
+        }
+        if (j.pitch !== undefined && j.pitch !== null) {
+          current.pitch = j.pitch;
+          document.getElementById('pitch').value = j.pitch;
+          onSlide(j.pitch);
+        }
+        setConn(true);
+        selectedId = send;
+        renderGrid();
+      } catch (e) {
+        document.getElementById('err').textContent = String(e.message || e);
+        setConn(false);
+      } finally {
+        if (card) card.classList.remove('loading');
+      }
+      if (loadQueued === null) break;
+      id = loadQueued;
+    }
+  } finally {
+    loadInflight = false;
+  }
+}
+async function loadSelected() {
+  if (selectedId) await loadPreset(selectedId);
 }
 
 function onVolInput(v) {
@@ -731,10 +798,10 @@ document.addEventListener('keydown', (e) => {
     nudgeVol(e.shiftKey ? -5 : -2);
   } else if (e.key === 'ArrowLeft') {
     e.preventDefault();
-    moveSelection(-1);
+    moveSelection(-1, { load: true });
   } else if (e.key === 'ArrowRight') {
     e.preventDefault();
-    moveSelection(1);
+    moveSelection(1, { load: true });
   } else if (e.key === 'Enter') {
     e.preventDefault();
     loadSelected();
