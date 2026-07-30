@@ -73,8 +73,7 @@ async def _connect_ble(*, force: bool = False, timeout: float = 25.0) -> KatanaB
         except Exception:
             pass
         raise RuntimeError(
-            "timeout ao conectar no BT-DUAL. "
-            "Luz MIDI ok? App do celular fechado?"
+            "timeout ao conectar no BT-DUAL MIDI; confira anúncio KATANA 3 MIDI"
         ) from e
     return k
 
