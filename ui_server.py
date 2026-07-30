@@ -257,10 +257,14 @@ async def load_preset(preset_id: str):
 
     async def _do(k: KatanaBLE):
         preset = json.loads(path.read_text())
-        await k.apply_preset(preset)
-        p = await k.read_patch()
+        # Full .tsl dumps can be loud — soft cap unless preset volume already lower
+        await k.apply_preset(preset, volume_cap=50)
+        p = await k.read_status_light() if hasattr(k, "read_status_light") else await k.read_patch()
+        # prefer light status; fall back
+        if "amp" not in p:
+            p = await k.read_patch()
         try:
-            d = await k.request(0x20001C48, 12)
+            d = await k.request(0x20001C48, 12, timeout=1.5)
             _state["pitch"] = d[2] - 24
         except Exception:
             pass
@@ -270,8 +274,10 @@ async def load_preset(preset_id: str):
             "ok": True,
             "id": preset_id,
             "name": p.get("name"),
-            "pitch": _state["pitch"],
+            "pitch": _state.get("pitch"),
             "amp": p.get("amp"),
+            "full": bool(preset.get("raw_blocks")),
+            "chain": (preset.get("chain") or {}).get("label"),
         }
 
     return await with_k(_do)

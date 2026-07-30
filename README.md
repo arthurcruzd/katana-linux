@@ -44,7 +44,18 @@ python3 -m venv .venv
 
 (`bleak` is only used for scanning helpers; live I/O goes through BlueZ D-Bus because bleak's AcquireNotify is refused by the BT-DUAL.)
 
-## Web UI (pitch slider)
+## Full .tsl load (chain + all blocks)
+
+```bash
+# Direct from Tone Exchange file (safe volume cap default 45)
+.venv/bin/python katana_ble.py load-tsl samples/tsl/SRV\ Blues.tsl --volume-cap 40
+
+# Or import then load via UI / load command
+.venv/bin/python tools/tsl_import.py file.tsl --write-preset
+.venv/bin/python katana_ble.py load presets/tsl-srv-blues.json --volume-cap 40
+```
+
+Full loads write ~78 DT1 blocks (types, details, EQ, assigns, chain). Use `--no-volume-cap` only if you trust the patch volume. After a bulk load, if status hangs, disconnect/reconnect BT once.
 
 ```bash
 cd ~/Documents/CODE/katana-linux

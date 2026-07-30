@@ -524,18 +524,107 @@ class KatanaBLE:
             },
         }
 
-    async def apply_preset(self, preset: dict[str, Any]) -> None:
-        """Write a preset dict (same shape as read_patch / JSON files)."""
+    async def apply_raw_blocks(
+        self,
+        raw_blocks: dict[str, list[int]],
+        *,
+        volume_cap: int | None = None,
+        progress: bool = False,
+    ) -> dict[str, int]:
+        """Write a full .tsl-style paramSet (PATCH%… → bytes) into temp patch."""
+        import sys
+        from pathlib import Path
+
+        tools = str(Path(__file__).resolve().parent / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from patch_map import ordered_blocks  # type: ignore
+
+        blocks = ordered_blocks(raw_blocks)
+        wrote = 0
+        skipped = 0
+        for name, addr, data in blocks:
+            if not data:
+                skipped += 1
+                continue
+            payload = list(data)
+            # optional safety: don't blast face with Tone Exchange volumes
+            if volume_cap is not None and name == "AMP" and len(payload) > 1:
+                payload[1] = min(payload[1], int(volume_cap) & 0x7F)
+            # After FX type bytes, brief settle so detail overlay can attach
+            try:
+                await self.write_bytes(addr, payload, gap=0.008, pace=0.0)
+                wrote += 1
+                if progress and wrote % 10 == 0:
+                    print(f"  … {wrote}/{len(blocks)} blocks", flush=True)
+                if name.startswith("FX(") and not name.startswith("FX_DETAIL"):
+                    await asyncio.sleep(0.05)
+                # pace large dumps so BlueZ/amp don't stall
+                elif len(payload) > 64:
+                    await asyncio.sleep(0.025)
+                elif wrote % 5 == 0:
+                    await asyncio.sleep(0.012)
+            except Exception as e:
+                skipped += 1
+                if progress:
+                    print(f"  skip {name}: {e}", flush=True)
+        await asyncio.sleep(0.4)
+        return {"wrote": wrote, "skipped": skipped, "total": len(blocks)}
+
+    async def apply_preset(self, preset: dict[str, Any], *, volume_cap: int | None = 55) -> None:
+        """Write a preset dict. If raw_blocks present (from .tsl), do full fidelity write."""
+        raw = preset.get("raw_blocks")
+        if isinstance(raw, dict) and raw:
+            # Prefer explicit cap from preset amp if lower
+            amp = preset.get("amp") or {}
+            cap = volume_cap
+            if "volume" in amp and volume_cap is not None:
+                cap = min(int(amp["volume"]), int(volume_cap))
+            elif "volume" in amp:
+                cap = int(amp["volume"])
+            await self.apply_raw_blocks(raw, volume_cap=cap, progress=False)
+            return
+
         name = (preset.get("name") or "PRESET")[:16].ljust(16)
         await self.write_bytes(ADDR["com"], [ord(c) & 0x7F for c in name])
 
         amp = preset["amp"]
         amp_bytes = [int(amp[f]) & 0x7F for f in AMP_FIELDS]
+        if volume_cap is not None:
+            amp_bytes[1] = min(amp_bytes[1], int(volume_cap))
         await self.write_bytes(ADDR["amp"], amp_bytes)
 
         sw = preset.get("sw") or {}
         sw_bytes = [int(sw.get(f, 0)) & 0x7F for f in SW_FIELDS]
         await self.write_bytes(ADDR["sw"], sw_bytes)
+
+        # chain / color if present in high-level form
+        ch = preset.get("chain") or {}
+        if "index" in ch:
+            other = [
+                int(ch.get("index", 2)) & 0x7F,
+                int(ch.get("cabinet_resonance", 1)) & 0x7F,
+                int(ch.get("master_key", 0)) & 0x7F,
+            ]
+            await self.write_bytes(0x20000200, other)
+            if "pdl_pos" in ch:
+                await self.write_bytes(0x20004800, [int(ch["pdl_pos"]) & 0x7F])
+            if "sr_pos" in ch:
+                # SENDRETURN byte1 = position
+                try:
+                    sr = await self.request(0x20005A00, 5, timeout=1.2)
+                    sr[1] = int(ch["sr_pos"]) & 0x7F
+                    await self.write_bytes(0x20005A00, sr)
+                except Exception:
+                    await self.write_bytes(0x20005A01, [int(ch["sr_pos"]) & 0x7F])
+            if "eq1_pos" in ch:
+                await self.write_bytes(0x20004C00, [int(ch["eq1_pos"]) & 0x7F])
+            if "eq2_pos" in ch:
+                await self.write_bytes(0x20004E00, [int(ch["eq2_pos"]) & 0x7F])
+
+        col = preset.get("color") or {}
+        if "raw" in col and isinstance(col["raw"], list):
+            await self.write_bytes(0x20000400, [int(x) & 0x7F for x in col["raw"][:5]])
 
         d = preset.get("delay") or {}
         if "raw" in d and len(d["raw"]) >= 9:
@@ -577,7 +666,6 @@ class KatanaBLE:
             if "raw" in b and len(b["raw"]) >= 8:
                 bst = list(b["raw"])
             else:
-                # BOTTOM/TONE use ofs=50 in address_map (stored = value + 50)
                 bst = [0] * 8
                 bst[0] = int(b.get("type", 0))
                 bst[1] = int(b.get("drive", 50))
@@ -592,29 +680,22 @@ class KatanaBLE:
         fx = preset.get("fx")
         if fx:
             ftype = int(fx.get("type", FX_PITCH_SHIFTER))
-            # MOD uses FX(1..3); panel FX uses FX(4..6). Pitch detail UI binds to FX_DETAIL(1).
-            # Write type to all three MOD variations so color select can't miss.
             for rel in (0x1000, 0x1200, 0x1400):
                 await self.write_bytes(0x20000000 + rel, [ftype & 0x7F])
             if ftype == FX_PITCH_SHIFTER or fx.get("pitch_semitones") is not None:
                 pitch = max(-24, min(24, int(fx.get("pitch_semitones", -1))))
-                mode = int(fx.get("mode", 1))  # Fast/Medium often better for poly than mono
+                mode = int(fx.get("mode", 1))
                 level = int(fx.get("level", 100))
                 direct = int(fx.get("direct_mix", 0))
-                # FX_DETAIL(1..3) for the three MOD colors
                 for det in (0x1C00, 0x1E00, 0x2000):
                     base = 0x20000000 + det
-                    await self.write_bytes(base + PS_VOICE, [0])
-                    await self.write_bytes(base + PS_MODE1, [mode & 0x7F])
-                    await self.write_bytes(base + PS_PITCH1, [(pitch + 24) & 0x7F])
-                    await self.write_bytes(base + PS_FINE1, [50])
+                    await self.write_bytes(base + PS_VOICE, [0, mode & 0x7F, (pitch + 24) & 0x7F, 50])
                     await self.write_bytes(base + PS_PREDELAY1, enc_4x4(0))
                     await self.write_bytes(base + PS_LEVEL1, [level & 0x7F])
                     await self.write_bytes(base + PS_DIRECT_MIX, [direct & 0x7F])
-            # Ensure MOD color variation is 0 (green / FX1)
-            await self.write_bytes(0x20000400 + 0x01, [0])  # PATCH_COLOR MOD_COLOR if layout matches
+            await self.write_bytes(0x20000400 + 0x01, [0])
 
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
 
 
 def print_patch(p: dict[str, Any]) -> None:
@@ -664,13 +745,54 @@ async def cmd_save(k: KatanaBLE, path: Path) -> None:
     print(f"saved {path}  ({p['name']!r})")
 
 
-async def cmd_load(k: KatanaBLE, path: Path) -> None:
+async def cmd_load(k: KatanaBLE, path: Path, *, volume_cap: int | None = 55) -> None:
     preset = json.loads(path.read_text())
-    print(f"loading {path} -> {preset.get('name')!r}")
-    await k.apply_preset(preset)
+    raw_n = len(preset.get("raw_blocks") or {})
+    mode = f"full-tsl ({raw_n} blocks)" if raw_n else "structured"
+    print(f"loading {path} -> {preset.get('name')!r}  [{mode}]  vol_cap={volume_cap}")
+    await k.apply_preset(preset, volume_cap=volume_cap)
     p = await k.read_patch()
     print("readback:")
     print_patch(p)
+    if preset.get("chain"):
+        ch = preset["chain"]
+        print(f"chain meta: {ch.get('label')} #{ch.get('index')}  order={' → '.join(ch.get('order') or [])}")
+
+
+async def cmd_load_tsl(k: KatanaBLE, path: Path, *, index: int = 0, volume_cap: int | None = 45) -> None:
+    import sys
+    from pathlib import Path as P
+
+    tools = str(P(__file__).resolve().parent / "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    from tsl_import import decode_tone, iter_tones, load_tsl  # type: ignore
+
+    tsl = load_tsl(path)
+    tones = list(iter_tones(tsl))
+    if not tones:
+        raise SystemExit("no tones in tsl")
+    i = max(0, min(len(tones) - 1, index))
+    _, tone = tones[i]
+    preset = decode_tone(tone, liveset_name=str(tsl.get("name") or ""))
+    print(
+        f"loading tsl {path.name} [{i}/{len(tones)}] -> {preset['name']!r}  "
+        f"chain={preset['chain']['label']}  blocks={len(preset.get('raw_blocks') or {})}  vol_cap={volume_cap}"
+    )
+    stats = await k.apply_raw_blocks(preset["raw_blocks"], volume_cap=volume_cap, progress=True)
+    print("write stats:", stats)
+    print("chain order:", " → ".join(preset["chain"]["order"]))
+    # readback is best-effort — bulk write can leave notify queue busy
+    try:
+        await asyncio.sleep(0.5)
+        p = await k.read_status_light()
+        print("readback:")
+        print(f"  name: {p.get('name')!r}")
+        amp = p.get("amp") or {}
+        print(f"  amp: {amp.get('type_name')} gain={amp.get('gain')} vol={amp.get('volume')}")
+        print(f"  sw: {p.get('sw')}")
+    except Exception as e:
+        print(f"readback skipped ({type(e).__name__}: {e}) — writes were sent; reconnect if needed")
 
 
 async def cmd_set(k: KatanaBLE, field: str, value: int) -> None:
@@ -717,6 +839,13 @@ async def main() -> None:
     p.add_argument("path")
     p = sub.add_parser("load")
     p.add_argument("path")
+    p.add_argument("--volume-cap", type=int, default=55)
+    p.add_argument("--no-volume-cap", action="store_true")
+    p = sub.add_parser("load-tsl", help="Load Tone Exchange .tsl with full paramSet")
+    p.add_argument("path")
+    p.add_argument("--index", type=int, default=0)
+    p.add_argument("--volume-cap", type=int, default=45)
+    p.add_argument("--no-volume-cap", action="store_true")
     p = sub.add_parser("get")
     p.add_argument("field")
     p = sub.add_parser("set")
@@ -735,7 +864,11 @@ async def main() -> None:
         elif args.cmd == "save":
             await cmd_save(k, Path(args.path))
         elif args.cmd == "load":
-            await cmd_load(k, Path(args.path))
+            cap = None if args.no_volume_cap else args.volume_cap
+            await cmd_load(k, Path(args.path), volume_cap=cap)
+        elif args.cmd == "load-tsl":
+            cap = None if args.no_volume_cap else args.volume_cap
+            await cmd_load_tsl(k, Path(args.path), index=args.index, volume_cap=cap)
         elif args.cmd == "get":
             await cmd_get(k, args.field)
         elif args.cmd == "set":
