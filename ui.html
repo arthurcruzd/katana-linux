@@ -370,6 +370,26 @@ let pitchTimer = null;
 let pitchInflight = false;
 let pitchQueued = null;
 let saveTimer = null;
+let bleGen = 0;              // invalidates stale controls when preset changes
+let bleTail = Promise.resolve();
+
+function bleEnqueue(fn) {
+  const p = bleTail.then(fn, fn);
+  bleTail = p.catch(() => {});
+  return p;
+}
+
+function invalidateControlsForLoad() {
+  bleGen++;
+  clearTimeout(volTimer);
+  clearTimeout(pitchTimer);
+  clearTimeout(saveTimer);
+  volQueued = null;
+  pitchQueued = null;
+  for (const k of Object.keys(ampTimers)) clearTimeout(ampTimers[k]);
+  for (const k of Object.keys(ampQueued)) delete ampQueued[k];
+  return bleGen;
+}
 
 function schedulePresetSave(reason) {
   if (!current.presetId) return;
@@ -379,6 +399,8 @@ function schedulePresetSave(reason) {
 
 async function persistPreset(reason) {
   if (!current.presetId) return;
+  const presetId = current.presetId;
+  const gen = bleGen;
   const amp = { ...(current.amp || {}) };
   // live slider values win
   amp.volume = current.volume;
@@ -394,7 +416,8 @@ async function persistPreset(reason) {
     cleanAmp[k] = typeof v === 'number' ? v : v;
   }
   try {
-    const j = await apiJSON('/api/presets/' + encodeURIComponent(current.presetId), {
+    if (gen !== bleGen || presetId !== current.presetId) return;
+    const j = await apiJSON('/api/presets/' + encodeURIComponent(presetId), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -402,8 +425,9 @@ async function persistPreset(reason) {
         pitch_semitones: current.pitch,
       }),
     });
-    // keep library list in sync
-    const p = presets.find(x => x.id === current.presetId);
+    // keep library list in sync only if still on same preset
+    if (gen !== bleGen || presetId !== current.presetId) return;
+    const p = presets.find(x => x.id === presetId);
     if (p) {
       p.amp = { ...(p.amp || {}), ...cleanAmp };
       p.hay = [p.name, p.song, p.tuning, p.notes, p.id, p.artist, p.ampName].join(' ').toLowerCase();
@@ -634,16 +658,19 @@ function moveSelection(delta, { load = true } = {}) {
 
 let loadInflight = false;
 let loadQueued = null;
-async function loadPreset(id) {
+async function loadPreset(id, existingGen = null) {
   if (!id) return;
+  const requestedGen = existingGen ?? invalidateControlsForLoad();
   if (loadInflight) {
-    loadQueued = id;
+    loadQueued = { id, gen: requestedGen };
     return;
   }
   loadInflight = true;
+  let next = { id, gen: requestedGen };
   try {
-    while (true) {
-      const send = loadQueued === null ? id : loadQueued;
+    while (next) {
+      const send = next.id;
+      const gen = next.gen;
       loadQueued = null;
       const card = document.querySelector(`.card[data-id="${CSS.escape(send)}"]`);
       if (card) card.classList.add('loading');
@@ -652,11 +679,17 @@ async function loadPreset(id) {
       const t0 = performance.now();
       try {
         const url = '/api/presets/' + encodeURIComponent(send) + '/load';
-        const j = await apiJSON(url, { method: 'POST' }, { retries: 4 });
+        const j = await bleEnqueue(async () => {
+          if (gen !== bleGen) return { stale: true };
+          return apiJSON(url, { method: 'POST' }, { retries: 2 });
+        });
+        if (j.stale || gen !== bleGen) {
+          next = loadQueued;
+          continue;
+        }
         const ms = Math.round(performance.now() - t0);
-        current.presetId = send;
+        current.presetId = j.id || send;
         current.name = j.name || send;
-        if (j.id) current.presetId = j.id;
         document.getElementById('msg').textContent = `preset ok · ${ms}ms`;
         document.getElementById('npName').textContent = j.name || send;
         const meta = presets.find(p => p.id === send);
@@ -678,16 +711,31 @@ async function loadPreset(id) {
         selectedId = send;
         renderGrid();
       } catch (e) {
-        document.getElementById('err').textContent = String(e.message || e);
-        setConn(false);
+        if (gen === bleGen) document.getElementById('err').textContent = String(e.message || e);
       } finally {
         if (card) card.classList.remove('loading');
       }
-      if (loadQueued === null) break;
-      id = loadQueued;
+      next = loadQueued;
     }
   } finally {
     loadInflight = false;
+    // A click can land between the final next check and this finally.
+    if (loadQueued) {
+      const q = loadQueued;
+      loadQueued = null;
+      loadPreset(q.id, q.gen);
+      return;
+    }
+    // Apply only the latest controls after the final preset is loaded.
+    if (volQueued !== null) {
+      const q = volQueued; volQueued = null; setVol(q);
+    }
+    if (pitchQueued !== null) {
+      const q = pitchQueued; pitchQueued = null; setPitch(q);
+    }
+    for (const field of Object.keys(ampQueued)) {
+      const q = ampQueued[field]; delete ampQueued[field]; setAmp(field, q);
+    }
   }
 }
 async function loadSelected() {
@@ -707,16 +755,24 @@ async function setVol(v) {
   document.getElementById('volVal').textContent = v;
   current.volume = v;
   if (current.amp) current.amp.volume = v;
+  // Controls made while presets are switching belong to the final preset.
+  if (loadInflight) { volQueued = v; return; }
+  const gen = bleGen;
   if (volInflight) { volQueued = v; return; }
   volInflight = true;
   try {
-    while (true) {
+    while (gen === bleGen) {
       const send = volQueued === null ? v : volQueued;
       volQueued = null;
-      await apiJSON('/api/amp', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ field: 'volume', value: send })
+      const stale = await bleEnqueue(async () => {
+        if (gen !== bleGen) return true;
+        await apiJSON('/api/amp', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ field: 'volume', value: send })
+        }, { retries: 2 });
+        return false;
       });
+      if (stale || gen !== bleGen) break;
       setConn(true);
       document.getElementById('msg').textContent = `vol ${send}`;
       document.getElementById('err').textContent = '';
@@ -725,9 +781,12 @@ async function setVol(v) {
       v = volQueued;
     }
   } catch (e) {
-    document.getElementById('err').textContent = String(e.message || e);
+    if (gen === bleGen) document.getElementById('err').textContent = String(e.message || e);
   } finally {
     volInflight = false;
+    if (volQueued !== null) {
+      const q = volQueued; volQueued = null; setVol(q);
+    }
   }
 }
 function nudgeVol(delta) {
@@ -746,17 +805,24 @@ async function setPitch(v) {
   document.getElementById('pitch').value = v;
   onSlide(v);
   current.pitch = v;
+  // Controls made while presets are switching belong to the final preset.
+  if (loadInflight) { pitchQueued = v; return; }
+  const gen = bleGen;
   if (pitchInflight) { pitchQueued = v; return; }
   pitchInflight = true;
   try {
-    while (true) {
+    while (gen === bleGen) {
       const send = pitchQueued === null ? v : pitchQueued;
       pitchQueued = null;
       const t0 = performance.now();
-      const j = await apiJSON('/api/pitch', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ semitones: send })
+      const j = await bleEnqueue(async () => {
+        if (gen !== bleGen) return { stale: true };
+        return apiJSON('/api/pitch', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ semitones: send })
+        }, { retries: 2 });
       });
+      if (j.stale || gen !== bleGen) break;
       const ms = Math.round(performance.now() - t0);
       document.getElementById('msg').textContent = `tom ${fmtPitch(j.pitch)} · ${ms}ms`;
       document.getElementById('err').textContent = '';
@@ -766,9 +832,12 @@ async function setPitch(v) {
       v = pitchQueued;
     }
   } catch (e) {
-    document.getElementById('err').textContent = String(e.message || e);
+    if (gen === bleGen) document.getElementById('err').textContent = String(e.message || e);
   } finally {
     pitchInflight = false;
+    if (pitchQueued !== null) {
+      const q = pitchQueued; pitchQueued = null; setPitch(q);
+    }
   }
 }
 
@@ -795,19 +864,27 @@ function queueAmp(field, value) {
 }
 async function setAmp(field, value) {
   value = +value;
+  // Controls made while presets are switching belong to the final preset.
+  if (loadInflight) { ampQueued[field] = value; return; }
+  const gen = bleGen;
   if (ampInflight[field]) {
     ampQueued[field] = value;
     return;
   }
   ampInflight[field] = true;
   try {
-    while (true) {
+    while (gen === bleGen) {
       const send = ampQueued[field] === undefined ? value : ampQueued[field];
       delete ampQueued[field];
-      await apiJSON('/api/amp', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ field, value: send })
+      const stale = await bleEnqueue(async () => {
+        if (gen !== bleGen) return true;
+        await apiJSON('/api/amp', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ field, value: send })
+        }, { retries: 2 });
+        return false;
       });
+      if (stale || gen !== bleGen) break;
       if (!current.amp) current.amp = {};
       current.amp[field] = send;
       if (field === 'volume') current.volume = send;
@@ -818,9 +895,12 @@ async function setAmp(field, value) {
       value = ampQueued[field];
     }
   } catch (e) {
-    document.getElementById('err').textContent = String(e.message || e);
+    if (gen === bleGen) document.getElementById('err').textContent = String(e.message || e);
   } finally {
     ampInflight[field] = false;
+    if (ampQueued[field] !== undefined) {
+      const q = ampQueued[field]; delete ampQueued[field]; setAmp(field, q);
+    }
   }
 }
 
@@ -907,10 +987,10 @@ document.addEventListener('keydown', (e) => {
     nudgeVol(e.shiftKey ? -5 : -2);
   } else if (e.key === 'ArrowLeft') {
     e.preventDefault();
-    moveSelection(-1, { load: true });
+    if (!e.repeat) moveSelection(-1, { load: true });
   } else if (e.key === 'ArrowRight') {
     e.preventDefault();
-    moveSelection(1, { load: true });
+    if (!e.repeat) moveSelection(1, { load: true });
   } else if (e.key === 'Enter') {
     e.preventDefault();
     loadSelected();

@@ -72,6 +72,20 @@ Requires BT-DUAL already bonded and in **KATANA 3 MIDI** mode. Pitch shifter typ
 .venv/bin/python katana_ble.py set gain 80
 ```
 
+## UI stress tests
+
+The browser test launches headless Chrome, rapidly switches presets and adjusts
+volume, pitch, gain, middle and presence. It snapshots/restores `presets/*.json`,
+so autosave does not alter the preset library during the test.
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python tools/browser_stress.py
+
+# Longer API-level normal-use simulation (non-destructive by default)
+.venv/bin/python tools/sim_usage.py --skip-connect
+```
+
 ## Protocol (Katana Gen 3)
 
 ```

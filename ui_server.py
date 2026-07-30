@@ -15,26 +15,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from katana_ble import (
-    ADDR,
-    AMP_FIELDS,
-    KatanaBLE,
-    PS_DIRECT_MIX,
-    PS_FINE1,
-    PS_LEVEL1,
-    PS_MODE1,
-    PS_PITCH1,
-    PS_PREDELAY1,
-    PS_VOICE,
-    enc_4x4,
-)
+from katana_ble import ADDR, AMP_FIELDS, KatanaBLE
 
 ROOT = Path(__file__).resolve().parent
 PRESETS = ROOT / "presets"
 
-# Shared connection (one BLE link)
-_lock = asyncio.Lock()
-_connect_lock = asyncio.Lock()  # separate so status isn't blocked forever
+# _ops_lock serializes BLE I/O only (short holds)
+# _connect_lock prevents parallel connect attempts
+_ops_lock = asyncio.Lock()
+_connect_lock = asyncio.Lock()
 _katana: KatanaBLE | None = None
 _state = {
     "connected": False,
@@ -42,96 +31,90 @@ _state = {
     "name": "",
     "error": "",
     "pitch_armed": False,
-    "busy": "",  # "connecting" | "loading" | ""
+    "busy": "",  # connecting | loading | ""
 }
 
 
-async def get_k(*, force: bool = False, connect_timeout: float = 35.0) -> KatanaBLE:
+def _snap_disconnected(extra_error: str = "") -> dict:
+    return {
+        "connected": False,
+        "name": _state.get("name") or "",
+        "pitch": _state.get("pitch", 0),
+        "amp": None,
+        "sw": None,
+        "error": extra_error or _state.get("error") or "",
+        "busy": _state.get("busy") or "",
+    }
+
+
+async def _connect_ble(*, force: bool = False, timeout: float = 25.0) -> KatanaBLE:
+    """Open BLE outside ops lock. Caller installs into _katana."""
     global _katana
     if force and _katana is not None:
         try:
-            await asyncio.wait_for(_katana.disconnect(drop_link=True), timeout=5.0)
+            await asyncio.wait_for(_katana.disconnect(drop_link=True), timeout=4.0)
         except Exception:
             pass
         _katana = None
         _state["connected"] = False
         _state["pitch_armed"] = False
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.3)
 
-    if _katana is None or not _state["connected"]:
-        k = KatanaBLE()
+    if _katana is not None and _state.get("connected"):
+        return _katana
+
+    k = KatanaBLE()
+    try:
+        await asyncio.wait_for(k.connect(force=force), timeout=timeout)
+    except asyncio.TimeoutError as e:
         try:
-            await asyncio.wait_for(k.connect(force=force), timeout=connect_timeout)
-        except asyncio.TimeoutError as e:
-            try:
-                await k.disconnect(drop_link=True)
-            except Exception:
-                pass
-            raise RuntimeError(
-                "timeout ao conectar no BT-DUAL (~35s). "
-                "Luz do dongle piscando/sólida em MIDI? App do celular fechado?"
-            ) from e
-        _katana = k
-        _state["connected"] = True
-        _state["error"] = ""
-    return _katana
+            await k.disconnect(drop_link=True)
+        except Exception:
+            pass
+        raise RuntimeError(
+            "timeout ao conectar no BT-DUAL. "
+            "Luz MIDI ok? App do celular fechado?"
+        ) from e
+    return k
 
 
-async def with_k(
-    fn,
-    *,
-    retry: bool = True,
-    lock_timeout: float = 40.0,
-    wait_busy: float = 12.0,
-    auto_connect: bool = True,
-):
-    """Run fn(k). Wait for lock so rapid clicks queue instead of failing."""
+async def with_ops(fn, *, wait_busy: float = 10.0, require_conn: bool = True):
+    """Run fn(k) holding ops lock briefly. Does not connect (unless require_conn=False)."""
     deadline = asyncio.get_event_loop().time() + wait_busy
     while True:
         remaining = deadline - asyncio.get_event_loop().time()
         if remaining <= 0:
             raise HTTPException(
-                503,
-                f"ocupado ({_state.get('busy') or 'ble'}) — tente de novo em 1s",
+                503, f"ocupado ({_state.get('busy') or 'ble'}) — aguarde"
             )
         try:
-            await asyncio.wait_for(
-                _lock.acquire(), timeout=min(lock_timeout, max(0.15, remaining))
-            )
+            await asyncio.wait_for(_ops_lock.acquire(), timeout=min(1.5, remaining))
             break
         except asyncio.TimeoutError:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.04)
             continue
     try:
-        try:
-            if _state.get("connected") and _katana is not None:
-                k = _katana
-            elif auto_connect:
-                k = await get_k(connect_timeout=20.0)
-            else:
+        if require_conn:
+            if not _state.get("connected") or _katana is None:
                 raise HTTPException(400, "não conectado — clique em Conectar")
-            return await fn(k)
-        except HTTPException:
-            raise
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            _state["error"] = err
+            k = _katana
+        else:
+            k = _katana
+        return await fn(k)
+    except HTTPException:
+        raise
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        # transport death
+        if "Timeout" in type(e).__name__ or "DT1" in str(e) or "Connect" in str(e):
             _state["connected"] = False
-            if not retry or not auto_connect:
-                raise HTTPException(500, err) from e
-            try:
-                k = await get_k(force=True, connect_timeout=25.0)
-                return await fn(k)
-            except Exception as e2:
-                _state["connected"] = False
-                _state["error"] = f"{type(e2).__name__}: {e2}"
-                raise HTTPException(500, _state["error"]) from e2
+            _state["error"] = err
+        raise HTTPException(500, err) from e
     finally:
-        _lock.release()
+        _ops_lock.release()
 
 
 async def ensure_pitch_mod(k: KatanaBLE, semis: int, *, full: bool = False) -> int:
-    """Fast path: 1-byte pitch write. Full arm only once per session."""
     semis = max(-24, min(24, int(semis)))
     if full or not _state.get("pitch_armed"):
         await k.arm_pitch_shifter(semis)
@@ -167,7 +150,6 @@ class AmpIn(BaseModel):
 
 
 class PresetPatchIn(BaseModel):
-    """Partial update written back to the preset JSON on disk."""
     amp: dict[str, int | str | float | None] | None = None
     pitch_semitones: int | None = Field(default=None, ge=-24, le=24)
     sw: dict[str, int] | None = None
@@ -175,32 +157,25 @@ class PresetPatchIn(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html_path = ROOT / "ui.html"
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    return HTMLResponse((ROOT / "ui.html").read_text(encoding="utf-8"))
 
 
 @app.get("/api/status")
 async def status():
-    # Fast path: never block the whole UI if BLE is connecting
     if _state.get("busy") == "connecting":
+        return _snap_disconnected()
+    if not _state.get("connected") or _katana is None:
+        return _snap_disconnected()
+    # Never report a false disconnect while a preset/control owns BLE.
+    if _ops_lock.locked() or _state.get("busy"):
         return {
-            "connected": False,
+            "connected": True,
             "name": _state.get("name") or "",
             "pitch": _state.get("pitch", 0),
             "amp": None,
             "sw": None,
             "error": "",
-            "busy": "connecting",
-        }
-    if not _state.get("connected") or _katana is None:
-        return {
-            "connected": False,
-            "name": "",
-            "pitch": _state.get("pitch", 0),
-            "amp": None,
-            "sw": None,
-            "error": _state.get("error") or "",
-            "busy": _state.get("busy") or "",
+            "busy": _state.get("busy") or "ble",
         }
 
     async def _do(k: KatanaBLE):
@@ -216,79 +191,80 @@ async def status():
             "amp": p.get("amp"),
             "sw": p.get("sw"),
             "error": "",
-            "busy": "",
+            "busy": _state.get("busy") or "",
         }
 
     try:
-        return await with_k(_do, retry=False, lock_timeout=3.0)
+        return await with_ops(_do, wait_busy=2.5)
     except HTTPException as he:
-        return JSONResponse(
-            {
-                "connected": False,
-                "name": "",
-                "pitch": _state.get("pitch", 0),
-                "amp": None,
-                "sw": None,
-                "error": he.detail,
-                "busy": _state.get("busy") or "",
-            }
-        )
+        return JSONResponse(_snap_disconnected(str(he.detail)))
 
 
 @app.post("/api/connect")
 async def connect():
-    if _connect_lock.locked() or _state.get("busy") == "connecting":
-        # wait briefly instead of hard 409
-        for _ in range(40):
-            if not _connect_lock.locked() and _state.get("busy") != "connecting":
+    global _katana
+    # Wait if another connect is running
+    if _connect_lock.locked():
+        for _ in range(50):
+            if not _connect_lock.locked():
                 break
             await asyncio.sleep(0.15)
-        if _connect_lock.locked() or _state.get("busy") == "connecting":
-            raise HTTPException(409, "já conectando — aguarde alguns segundos")
+        if _connect_lock.locked():
+            raise HTTPException(409, "já conectando")
 
     async with _connect_lock:
+        if _state.get("connected") and _katana is not None:
+            # already up — just ping
+            try:
+                async def _ping(k):
+                    return await k.read_status_light()
+
+                p = await with_ops(_ping, wait_busy=3.0)
+                return {
+                    "ok": True,
+                    "connected": True,
+                    "pitch": _state.get("pitch"),
+                    "name": p.get("name"),
+                }
+            except Exception:
+                _state["connected"] = False
+
         _state["busy"] = "connecting"
         _state["error"] = ""
         try:
+            # BLE connect OUTSIDE ops lock so amp/pitch aren't blocked for 30s
             try:
-                await asyncio.wait_for(_lock.acquire(), timeout=15.0)
-            except asyncio.TimeoutError as e:
-                raise HTTPException(503, "BLE ocupado — aguarde o fim da operação anterior") from e
-            try:
+                k = await _connect_ble(force=False, timeout=18.0)
+            except Exception as soft_err:
+                _state["error"] = f"soft: {soft_err}"
+                k = await _connect_ble(force=True, timeout=30.0)
+
+            # install under ops lock briefly
+            async with _ops_lock:
+                _katana = k
+                _state["connected"] = True
                 _state["pitch_armed"] = False
-                # Soft connect first — force+scan often causes le-connection-abort-by-local
-                try:
-                    k = await get_k(force=False, connect_timeout=20.0)
-                except Exception as soft_err:
-                    _state["error"] = f"soft: {soft_err}"
-                    k = await get_k(force=True, connect_timeout=35.0)
                 pitch = int(_state.get("pitch", -1) or -1)
                 try:
-                    await asyncio.wait_for(ensure_pitch_mod(k, pitch, full=True), timeout=8.0)
+                    await asyncio.wait_for(ensure_pitch_mod(k, pitch, full=True), timeout=6.0)
                 except Exception:
                     pass
-                _state["connected"] = True
-                _state["error"] = ""
-                # quick identity
                 name = ""
                 try:
-                    p = await asyncio.wait_for(k.read_status_light(), timeout=4.0)
+                    p = await asyncio.wait_for(k.read_status_light(), timeout=3.5)
                     name = p.get("name") or ""
                     _state["name"] = name
-                    if p.get("amp"):
-                        pass
+                    if p.get("pitch") is not None:
+                        _state["pitch"] = p["pitch"]
                 except Exception:
                     pass
+                _state["error"] = ""
                 return {
                     "ok": True,
                     "connected": True,
                     "pitch": _state["pitch"],
                     "name": name,
                 }
-            finally:
-                _lock.release()
-        except HTTPException:
-            raise
         except Exception as e:
             _state["connected"] = False
             _state["pitch_armed"] = False
@@ -302,10 +278,9 @@ async def connect():
 async def set_pitch(body: PitchIn):
     async def _do(k: KatanaBLE):
         rb = await ensure_pitch_mod(k, body.semitones, full=False)
-        _state["connected"] = True
         return {"ok": True, "pitch": rb, "requested": body.semitones}
 
-    return await with_k(_do, wait_busy=8.0, lock_timeout=2.0, auto_connect=False, retry=False)
+    return await with_ops(_do, wait_busy=6.0)
 
 
 @app.post("/api/amp")
@@ -316,10 +291,9 @@ async def set_amp(body: AmpIn):
     async def _do(k: KatanaBLE):
         off = AMP_FIELDS.index(body.field)
         await k.write_bytes(ADDR["amp"] + off, [body.value & 0x7F], gap=0.0, pace=0.0)
-        _state["connected"] = True
         return {"ok": True, "field": body.field, "value": body.value}
 
-    return await with_k(_do, wait_busy=8.0, lock_timeout=2.0, auto_connect=False, retry=False)
+    return await with_ops(_do, wait_busy=6.0)
 
 
 @app.get("/api/presets")
@@ -343,6 +317,8 @@ async def list_presets():
                         "gain": amp.get("gain"),
                         "volume": amp.get("volume"),
                     },
+                    "full": bool(meta.get("raw_blocks")),
+                    "chain": (meta.get("chain") or {}).get("label"),
                 }
             )
         except Exception:
@@ -354,6 +330,7 @@ async def list_presets():
                     "song": "",
                     "tuning": "",
                     "amp": {},
+                    "full": False,
                 }
             )
     return out
@@ -366,43 +343,46 @@ async def load_preset(preset_id: str):
         raise HTTPException(404, "preset not found")
 
     async def _do(k: KatanaBLE):
-        preset = json.loads(path.read_text())
-        # Full .tsl dumps can be loud — soft cap unless preset volume already lower
-        await k.apply_preset(preset, volume_cap=50)
-        p = await k.read_status_light() if hasattr(k, "read_status_light") else await k.read_patch()
-        # prefer light status; fall back
-        if "amp" not in p:
-            p = await k.read_patch()
+        _state["busy"] = "loading"
         try:
-            d = await k.request(0x20001C48, 12, timeout=1.5)
-            _state["pitch"] = d[2] - 24
-        except Exception:
-            pass
-        _state["connected"] = True
-        _state["active_preset"] = preset_id
-        return {
-            "ok": True,
-            "id": preset_id,
-            "name": p.get("name"),
-            "pitch": _state.get("pitch"),
-            "amp": p.get("amp"),
-            "full": bool(preset.get("raw_blocks")),
-            "chain": (preset.get("chain") or {}).get("label"),
-        }
+            preset = json.loads(path.read_text())
+            _state["pitch_armed"] = False
+            await k.apply_preset(preset, volume_cap=50)
+            # light readback
+            try:
+                p = await k.read_status_light()
+            except Exception:
+                p = await k.read_patch()
+            try:
+                d = await k.request(0x20001C48, 12, timeout=1.5)
+                _state["pitch"] = d[2] - 24
+            except Exception:
+                pass
+            _state["name"] = p.get("name") or preset.get("name") or ""
+            _state["active_preset"] = preset_id
+            return {
+                "ok": True,
+                "id": preset_id,
+                "name": p.get("name"),
+                "pitch": _state.get("pitch"),
+                "amp": p.get("amp"),
+                "full": bool(preset.get("raw_blocks")),
+                "chain": (preset.get("chain") or {}).get("label"),
+            }
+        finally:
+            if _state.get("busy") == "loading":
+                _state["busy"] = ""
 
-    return await with_k(_do)
+    return await with_ops(_do, wait_busy=90.0)
 
 
 @app.patch("/api/presets/{preset_id:path}")
 async def patch_preset(preset_id: str, body: PresetPatchIn):
-    """Persist slider tweaks into the preset file (volume, EQ, pitch…)."""
-    # prevent path traversal
     path = (PRESETS / preset_id).resolve()
     if not str(path).startswith(str(PRESETS.resolve())) or path.suffix != ".json":
         raise HTTPException(400, "invalid preset id")
     if not path.exists():
         raise HTTPException(404, "preset not found")
-
     try:
         data = json.loads(path.read_text())
     except Exception as e:
@@ -420,21 +400,17 @@ async def patch_preset(preset_id: str, body: PresetPatchIn):
                     amp[k] = int(v)
                 except (TypeError, ValueError):
                     continue
-
     if body.sw:
         sw = data.setdefault("sw", {})
         for k, v in body.sw.items():
             sw[k] = int(v)
-
     if body.pitch_semitones is not None:
         fx = data.setdefault("fx", {})
         fx["pitch_semitones"] = int(body.pitch_semitones)
-        # keep type as pitch shifter if present
         fx.setdefault("type", 11)
         fx.setdefault("type_name", "pitch_shifter")
 
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    _state["active_preset"] = preset_id
     return {
         "ok": True,
         "id": preset_id,

@@ -277,66 +277,72 @@ class KatanaBLE:
             pass
         await asyncio.sleep(0.3)
 
+    async def _btctl(self, *args: str, timeout: float = 12.0) -> tuple[int, str]:
+        """Run bluetoothctl non-interactively."""
+        proc = await asyncio.create_subprocess_exec(
+            "bluetoothctl",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return 124, "bluetoothctl timeout"
+        return proc.returncode or 0, (out or b"").decode(errors="replace")
+
     async def _ensure_connected(self, retries: int = 5) -> None:
         if await self._is_connected():
             return
 
-        # Always stop discovery — active scan causes le-connection-abort-by-local
+        # stop discovery first
         try:
             await self._call("/org/bluez/hci0", "org.bluez.Adapter1", "StopDiscovery")
         except Exception:
             pass
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
 
         last_err: Exception | None = None
+        mac = self.addr
         for attempt in range(1, retries + 1):
             try:
-                if attempt == 1:
-                    # gentle: just Connect on already-bonded device
-                    await self._call(self.dev, "org.bluez.Device1", "Connect")
-                else:
-                    try:
-                        await self._call(self.dev, "org.bluez.Device1", "Disconnect")
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.8 * attempt)
-                    # brief scan only on later retries
-                    await self._ble_scan_pulse(1.5)
-                    try:
-                        await self._call(
-                            "/org/bluez/hci0", "org.bluez.Adapter1", "StopDiscovery"
-                        )
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.4)
-                    await self._call(self.dev, "org.bluez.Device1", "Connect")
+                # Prefer bluetoothctl — more reliable than raw D-Bus Connect on Fedora
+                if attempt >= 2:
+                    await self._btctl("disconnect", mac, timeout=6.0)
+                    await asyncio.sleep(0.6)
+                    # short scan via bluetoothctl
+                    await self._btctl("--timeout", "5", "scan", "le", timeout=8.0)
+                    await asyncio.sleep(0.3)
 
-                for _ in range(30):
+                code, out = await self._btctl("connect", mac, timeout=12.0)
+                # even if ctl says failed, Connected prop may flip
+                for _ in range(25):
                     if await self._is_connected():
-                        await asyncio.sleep(0.6)
+                        await asyncio.sleep(0.5)
                         return
                     await asyncio.sleep(0.15)
-                last_err = RuntimeError("Connect returned but device stayed disconnected")
+
+                # fallback D-Bus Connect
+                try:
+                    await asyncio.wait_for(
+                        self._call(self.dev, "org.bluez.Device1", "Connect"),
+                        timeout=8.0,
+                    )
+                except Exception as e:
+                    last_err = e
+                for _ in range(20):
+                    if await self._is_connected():
+                        await asyncio.sleep(0.5)
+                        return
+                    await asyncio.sleep(0.15)
+
+                last_err = RuntimeError(
+                    f"bluetoothctl connect rc={code}: {out.strip()[:120] or 'no output'}"
+                )
             except Exception as e:
                 last_err = e
-                msg = str(e).lower()
-                if "already connected" in msg or "in progress" in msg:
-                    await asyncio.sleep(1.0)
-                    if await self._is_connected():
-                        return
-                    continue
-                if any(
-                    s in msg
-                    for s in (
-                        "abort-by-local",
-                        "inprogress",
-                        "le-connection",
-                        "br-connection",
-                        "busy",
-                    )
-                ):
-                    await asyncio.sleep(1.2 * attempt)
-                    continue
                 await asyncio.sleep(0.8 * attempt)
 
         raise RuntimeError(
