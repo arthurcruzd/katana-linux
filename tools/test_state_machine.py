@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ui_server as s
+from katana_ble import KatanaBLE
 
 
 class FakeKatana:
@@ -114,11 +115,28 @@ async def test_status_stays_connected_on_read_timeout():
     print("PASS read timeout does not create false disconnect")
 
 
-async def main():
+async def test_audio_name_is_rejected() -> None:
+    k = KatanaBLE()
+    k._is_connected = AsyncMock(return_value=False)
+    k._call = AsyncMock(side_effect=RuntimeError("not discovering"))
+    k._btctl = AsyncMock(return_value=(0, "scan complete"))
+    k._device_name = AsyncMock(return_value="KATANA 3 Audio")
+    try:
+        await k._ensure_connected(retries=1)
+    except RuntimeError as exc:
+        assert "dispositivo errado" in str(exc)
+        assert "Audio" in str(exc)
+    else:
+        raise AssertionError("Audio device was accepted as MIDI")
+    print("PASS KATANA 3 Audio is rejected before connect")
+
+
+async def main() -> None:
     await test_shared_connect()
     await test_command_waits_connect()
     await test_load_succeeds_when_readback_fails()
     await test_status_stays_connected_on_read_timeout()
+    await test_audio_name_is_rejected()
     print("PASS all state-machine regressions")
 
 

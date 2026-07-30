@@ -141,6 +141,7 @@ class KatanaBLE:
         self.io_path: str | None = None
         self._buf = bytearray()
         self.sysex: list[bytes] = []
+        self.readback_ok = False
 
     async def _call(self, path, iface, member, sig="", body=None, dest="org.bluez"):
         assert self.bus
@@ -167,7 +168,7 @@ class KatanaBLE:
         self.sysex.clear()
         self._buf = bytearray()
 
-        await self._ensure_connected(retries=3)
+        await self._ensure_connected(retries=2)
 
         for _ in range(40):
             objs = await self._call(
@@ -188,8 +189,7 @@ class KatanaBLE:
             await asyncio.sleep(0.25)
         if not self.io_path:
             raise RuntimeError(
-                "BLE-MIDI char not found. Amp in MIDI mode (nome KATANA 3 MIDI)? "
-                "LED sólido? Celular desconectado?"
+                "BLE-MIDI char not found. Confirme KATANA 3 MIDI e luz azul sólida."
             )
 
         await self._call(
@@ -228,17 +228,25 @@ class KatanaBLE:
         await asyncio.sleep(0.35)
 
         try:
-            await self.request(ADDR["com"], 0x10, timeout=3.0)
+            await self.request(ADDR["com"], 0x10, timeout=2.0)
+            self.readback_ok = True
         except TimeoutError:
-            if not force:
-                await self.disconnect(drop_link=True)
-                await asyncio.sleep(1.2)
-                await self.connect(force=True)
-                return
-            raise TimeoutError(
-                "Bluetooth ok, mas o amp não responde SysEx. "
-                "Segure o BT-DUAL até piscar (MIDI), feche o app do celular e Conectar de novo."
-            ) from None
+            # Notifications/link are active and writes can still work. Readback is
+            # diagnostic; never turn a usable write-only session into connect failure.
+            self.readback_ok = False
+
+    async def _device_name(self) -> str:
+        try:
+            props = await self._call(
+                self.dev,
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                "ss",
+                ["org.bluez.Device1", "Name"],
+            )
+            return str(props[0].value)
+        except Exception:
+            return ""
 
     async def _is_connected(self) -> bool:
         try:
@@ -293,62 +301,46 @@ class KatanaBLE:
             return 124, "bluetoothctl timeout"
         return proc.returncode or 0, (out or b"").decode(errors="replace")
 
-    async def _ensure_connected(self, retries: int = 5) -> None:
+    async def _ensure_connected(self, retries: int = 2) -> None:
         if await self._is_connected():
             return
 
-        # stop discovery first
         try:
             await self._call("/org/bluez/hci0", "org.bluez.Adapter1", "StopDiscovery")
         except Exception:
             pass
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.15)
 
-        last_err: Exception | None = None
+        last_detail = "sem resposta"
         mac = self.addr
         for attempt in range(1, retries + 1):
-            try:
-                # Prefer bluetoothctl — more reliable than raw D-Bus Connect on Fedora
-                if attempt >= 2:
-                    await self._btctl("disconnect", mac, timeout=6.0)
-                    await asyncio.sleep(0.6)
-                    # short scan via bluetoothctl
-                    await self._btctl("--timeout", "5", "scan", "le", timeout=8.0)
-                    await asyncio.sleep(0.3)
-
-                code, out = await self._btctl("connect", mac, timeout=12.0)
-                # even if ctl says failed, Connected prop may flip
-                for _ in range(25):
-                    if await self._is_connected():
-                        await asyncio.sleep(0.5)
-                        return
-                    await asyncio.sleep(0.15)
-
-                # fallback D-Bus Connect
-                try:
-                    await asyncio.wait_for(
-                        self._call(self.dev, "org.bluez.Device1", "Connect"),
-                        timeout=8.0,
-                    )
-                except Exception as e:
-                    last_err = e
-                for _ in range(20):
-                    if await self._is_connected():
-                        await asyncio.sleep(0.5)
-                        return
-                    await asyncio.sleep(0.15)
-
-                last_err = RuntimeError(
-                    f"bluetoothctl connect rc={code}: {out.strip()[:120] or 'no output'}"
+            # Refresh the advertisement, then make one bounded connect attempt.
+            code_scan, scan_out = await self._btctl(
+                "--timeout", "2", "scan", "le", timeout=3.0
+            )
+            await asyncio.sleep(0.1)
+            name = await self._device_name()
+            if name and "MIDI" not in name.upper():
+                raise RuntimeError(
+                    f"dispositivo errado detectado: {name}. O botão do BT-DUAL "
+                    "pareia Audio; apague o LED e reinicie o amp sem apertar o botão."
                 )
-            except Exception as e:
-                last_err = e
-                await asyncio.sleep(0.8 * attempt)
+            code, out = await self._btctl("connect", mac, timeout=5.0)
+            for _ in range(10):
+                if await self._is_connected():
+                    await asyncio.sleep(0.25)
+                    return
+                await asyncio.sleep(0.1)
+            detail = (out or scan_out or "sem saída do BlueZ").strip().replace("\n", " ")
+            last_detail = f"tentativa {attempt}: rc={code}, {detail[:180]}"
+            if attempt < retries:
+                await self._btctl("disconnect", mac, timeout=3.0)
+                await asyncio.sleep(0.4)
 
         raise RuntimeError(
-            f"falha ao conectar no BT-DUAL após {retries} tentativas: {last_err}. "
-            "Confira: luz piscando/sólida em MIDI, app do celular fechado, amp ligado."
-        ) from last_err
+            f"BT-DUAL MIDI não aceitou conexão ({last_detail}). "
+            "Reinicie o amp e não aperte o botão do BT-DUAL (esse botão pareia Audio)."
+        )
 
     async def hard_reset_link(self) -> None:
         """Drop BlueZ ACL link so the next Connect is fresh."""

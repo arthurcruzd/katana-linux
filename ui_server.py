@@ -85,7 +85,7 @@ async def with_ops(fn, *, wait_busy: float = 10.0, require_conn: bool = True):
         task = _connect_task
         if task is not None and not task.done():
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=70.0)
+                await asyncio.wait_for(asyncio.shield(task), timeout=35.0)
             except asyncio.TimeoutError as e:
                 raise HTTPException(504, "conexão ainda não terminou") from e
             except Exception as e:
@@ -251,11 +251,7 @@ async def _run_connect() -> dict:
         _state["busy"] = "connecting"
         _state["error"] = ""
         try:
-            try:
-                k = await _connect_ble(force=False, timeout=20.0)
-            except Exception as soft_err:
-                _state["error"] = f"soft: {soft_err}"
-                k = await _connect_ble(force=True, timeout=35.0)
+            k = await _connect_ble(force=False, timeout=25.0)
 
             async with _ops_lock:
                 _katana = k
@@ -302,7 +298,7 @@ async def connect():
         _connect_task = asyncio.create_task(_run_connect())
     task = _connect_task
     try:
-        return await asyncio.wait_for(asyncio.shield(task), timeout=70.0)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=35.0)
     except asyncio.TimeoutError as e:
         raise HTTPException(504, "conexão ainda em andamento — aguarde") from e
     except Exception as e:

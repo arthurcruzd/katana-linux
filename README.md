@@ -11,28 +11,30 @@ Tested on Fedora 44 + BlueZ 5.87 + Katana-50 Gen 3 + BT-DUAL.
 - Write parameters (DT1) with readback
 - Protocol taken from the official BOSS Tone Studio for Katana Gen 3 (JS sources)
 
-## One-time pairing
+## One-time MIDI pairing
+
+Important: the physical BT-DUAL pairing button controls **Bluetooth Audio**.
+Holding it until the blue indicator flashes rapidly advertises `KATANA 3 Audio`,
+not MIDI. The blue indicator is therefore not proof of a BLE-MIDI session.
+
+For MIDI, power-cycle the amp and do **not** press the BT-DUAL button:
 
 ```bash
-# Amp on, hold BT-DUAL button until LED blinks fast (MIDI mode, not Audio)
 bluetoothctl
 # in bluetoothctl:
 agent on
 default-agent
-scan on
-# wait until you see "KATANA 3 MIDI"
-connect E7:47:8F:03:0D:C4
-# when asked Accept pairing -> yes
-# then:
-menu gatt
-select-attribute /org/bluez/hci0/dev_E7_47_8F_03_0D_C4/service0007/char000b
-notify on
-# should say Notify started / Notifying: yes
+scan le
+# wait until you see exactly "KATANA 3 MIDI"; never pair "KATANA 3 Audio"
+pair E7:47:8F:03:0D:C4
 trust E7:47:8F:03:0D:C4
+connect E7:47:8F:03:0D:C4
 quit
 ```
 
-Solid blue LED = connected. Name must be **KATANA 3 MIDI** (not "KATANA 3 Audio").
+The application starts GATT notifications itself. Connection is considered usable
+after the BlueZ link and BLE-MIDI notify are active; SysEx readback is diagnostic
+because writes can remain functional when a DT1 read response is delayed.
 
 ## Setup
 

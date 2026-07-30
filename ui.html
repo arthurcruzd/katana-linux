@@ -941,11 +941,11 @@ async function refresh() {
   }
 }
 async function connect() {
-  document.getElementById('msg').textContent = 'conectando (pode levar até ~65s)…';
+  document.getElementById('msg').textContent = 'conectando (normal: 2–10s; limite 35s)…';
   document.getElementById('err').textContent = '';
   document.getElementById('btnConnect').disabled = true;
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), 70000);
+  const t = setTimeout(() => ac.abort(), 40000);
   try {
     const r = await fetch('/api/connect', { method: 'POST', signal: ac.signal });
     const j = await r.json();
