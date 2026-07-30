@@ -167,7 +167,7 @@ class KatanaBLE:
         self.sysex.clear()
         self._buf = bytearray()
 
-        await self._ensure_connected(retries=5)
+        await self._ensure_connected(retries=3)
 
         for _ in range(40):
             objs = await self._call(

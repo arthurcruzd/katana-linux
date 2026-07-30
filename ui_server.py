@@ -34,6 +34,7 @@ PRESETS = ROOT / "presets"
 
 # Shared connection (one BLE link)
 _lock = asyncio.Lock()
+_connect_lock = asyncio.Lock()  # separate so status isn't blocked forever
 _katana: KatanaBLE | None = None
 _state = {
     "connected": False,
@@ -41,35 +42,53 @@ _state = {
     "name": "",
     "error": "",
     "pitch_armed": False,
+    "busy": "",  # "connecting" | "loading" | ""
 }
 
 
-async def get_k(*, force: bool = False) -> KatanaBLE:
+async def get_k(*, force: bool = False, connect_timeout: float = 35.0) -> KatanaBLE:
     global _katana
     if force and _katana is not None:
         try:
-            await _katana.disconnect(drop_link=True)
+            await asyncio.wait_for(_katana.disconnect(drop_link=True), timeout=5.0)
         except Exception:
             pass
         _katana = None
         _state["connected"] = False
         _state["pitch_armed"] = False
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
 
     if _katana is None or not _state["connected"]:
         k = KatanaBLE()
-        await k.connect(force=force)
+        try:
+            await asyncio.wait_for(k.connect(force=force), timeout=connect_timeout)
+        except asyncio.TimeoutError as e:
+            try:
+                await k.disconnect(drop_link=True)
+            except Exception:
+                pass
+            raise RuntimeError(
+                "timeout ao conectar no BT-DUAL (~35s). "
+                "Luz do dongle piscando/sólida em MIDI? App do celular fechado?"
+            ) from e
         _katana = k
         _state["connected"] = True
         _state["error"] = ""
     return _katana
 
 
-async def with_k(fn, *, retry: bool = True):
-    """Run fn(k); on failure optionally hard-reconnect once and retry."""
-    async with _lock:
+async def with_k(fn, *, retry: bool = True, lock_timeout: float = 40.0):
+    """Run fn(k). Acquire lock with timeout so the UI never freezes forever."""
+    try:
+        await asyncio.wait_for(_lock.acquire(), timeout=lock_timeout)
+    except asyncio.TimeoutError as e:
+        raise HTTPException(
+            503,
+            f"ocupado ({_state.get('busy') or 'ble'}) — espere ou recarregue a página",
+        ) from e
+    try:
         try:
-            k = await get_k()
+            k = await get_k(connect_timeout=25.0)
             return await fn(k)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -78,12 +97,14 @@ async def with_k(fn, *, retry: bool = True):
             if not retry:
                 raise HTTPException(500, err) from e
             try:
-                k = await get_k(force=True)
+                k = await get_k(force=True, connect_timeout=30.0)
                 return await fn(k)
             except Exception as e2:
                 _state["connected"] = False
                 _state["error"] = f"{type(e2).__name__}: {e2}"
                 raise HTTPException(500, _state["error"]) from e2
+    finally:
+        _lock.release()
 
 
 async def ensure_pitch_mod(k: KatanaBLE, semis: int, *, full: bool = False) -> int:
@@ -137,6 +158,28 @@ async def index():
 
 @app.get("/api/status")
 async def status():
+    # Fast path: never block the whole UI if BLE is connecting
+    if _state.get("busy") == "connecting":
+        return {
+            "connected": False,
+            "name": _state.get("name") or "",
+            "pitch": _state.get("pitch", 0),
+            "amp": None,
+            "sw": None,
+            "error": "",
+            "busy": "connecting",
+        }
+    if not _state.get("connected") or _katana is None:
+        return {
+            "connected": False,
+            "name": "",
+            "pitch": _state.get("pitch", 0),
+            "amp": None,
+            "sw": None,
+            "error": _state.get("error") or "",
+            "busy": _state.get("busy") or "",
+        }
+
     async def _do(k: KatanaBLE):
         p = await k.read_status_light()
         _state["pitch"] = p.get("pitch", _state.get("pitch", 0))
@@ -150,11 +193,11 @@ async def status():
             "amp": p.get("amp"),
             "sw": p.get("sw"),
             "error": "",
+            "busy": "",
         }
 
     try:
-        # status: don't thrash BLE with force-reconnect loops
-        return await with_k(_do, retry=False)
+        return await with_k(_do, retry=False, lock_timeout=3.0)
     except HTTPException as he:
         return JSONResponse(
             {
@@ -164,26 +207,48 @@ async def status():
                 "amp": None,
                 "sw": None,
                 "error": he.detail,
+                "busy": _state.get("busy") or "",
             }
         )
 
 
 @app.post("/api/connect")
 async def connect():
-    async with _lock:
+    if _connect_lock.locked() or _state.get("busy") == "connecting":
+        raise HTTPException(409, "já conectando — aguarde alguns segundos")
+
+    async with _connect_lock:
+        _state["busy"] = "connecting"
+        _state["error"] = ""
         try:
-            _state["pitch_armed"] = False
-            k = await get_k(force=True)
-            pitch = int(_state.get("pitch", -1) or -1)
-            await ensure_pitch_mod(k, pitch, full=True)
-            _state["connected"] = True
-            _state["error"] = ""
-            return {"ok": True, "connected": True, "pitch": _state["pitch"]}
+            # don't hold the ops lock for the whole BLE dance if possible
+            try:
+                await asyncio.wait_for(_lock.acquire(), timeout=5.0)
+            except asyncio.TimeoutError as e:
+                raise HTTPException(503, "BLE ocupado com outra operação") from e
+            try:
+                _state["pitch_armed"] = False
+                k = await get_k(force=True, connect_timeout=40.0)
+                pitch = int(_state.get("pitch", -1) or -1)
+                try:
+                    await asyncio.wait_for(ensure_pitch_mod(k, pitch, full=True), timeout=8.0)
+                except Exception:
+                    # pitch arm optional at connect
+                    pass
+                _state["connected"] = True
+                _state["error"] = ""
+                return {"ok": True, "connected": True, "pitch": _state["pitch"]}
+            finally:
+                _lock.release()
+        except HTTPException:
+            raise
         except Exception as e:
             _state["connected"] = False
             _state["pitch_armed"] = False
             _state["error"] = f"{type(e).__name__}: {e}"
             raise HTTPException(500, _state["error"]) from e
+        finally:
+            _state["busy"] = ""
 
 
 @app.post("/api/pitch")
