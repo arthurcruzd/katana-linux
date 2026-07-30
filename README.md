@@ -44,7 +44,15 @@ python3 -m venv .venv
 
 (`bleak` is only used for scanning helpers; live I/O goes through BlueZ D-Bus because bleak's AcquireNotify is refused by the BT-DUAL.)
 
-## CLI
+## Web UI (pitch slider)
+
+```bash
+cd ~/Documents/CODE/katana-linux
+.venv/bin/python ui_server.py
+# open http://127.0.0.1:8765
+```
+
+Requires BT-DUAL already bonded and in **KATANA 3 MIDI** mode. Pitch shifter type must have been set once (phone BTS → MOD → Pitch Shifter); the slider then changes semitones live.
 
 ```bash
 .venv/bin/python katana_ble.py status
