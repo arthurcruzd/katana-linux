@@ -103,6 +103,20 @@ the tuner or clicking **Desligar** stops the media tracks and releases the
 microphone. Chrome treats `http://127.0.0.1` as a secure local context for
 microphone permission.
 
+### Voice pitch practice
+
+Inside **Afinador**, choose **Voz · treino de nota**. Select a target from C2
+through B5 (scientific name plus solfège), then click **Ouvir nota** for a quiet
+1.2-second reference tone. The detector expands to the vocal range (65–1000 Hz)
+and reports the nearest note, frequency, cents from the selected target, and a
+plain-language instruction to raise or lower the pitch.
+
+The stability trace shows pitch drift around the target, while the hold bar asks
+for three continuous seconds within ±10 cents. Reference playback temporarily
+pauses microphone analysis so the notebook does not score its own speaker. Start
+with comfortable notes and a relaxed vowel such as “ah”; never force range or
+volume.
+
 ## UI stress tests
 
 The browser test launches headless Chrome, rapidly switches presets and adjusts
@@ -112,6 +126,9 @@ so autosave does not alter the preset library during the test.
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python tools/browser_stress.py
+
+# Tuner/voice regression with a fake microphone; amp may be off
+.venv/bin/python tools/browser_stress.py --tuner-only
 
 # State-machine regressions (no amp required)
 .venv/bin/python tools/test_state_machine.py

@@ -48,7 +48,26 @@ def main() -> int:
         page.wait_for_selector(".card", timeout=10_000)
         page.wait_for_selector("#btnLive", timeout=2_000)
         page.wait_for_selector("#btnTuner", timeout=2_000)
+        page.wait_for_selector("#voiceMode", state="attached", timeout=2_000)
+        page.wait_for_selector("#voiceTarget", state="attached", timeout=2_000)
+        assert page.locator("#voiceTarget option").last.inner_text().startswith("B5")
         assert page.evaluate("typeof prepareLive === 'function' && liveSlots instanceof Map")
+        vocal = page.evaluate("""
+          () => {
+            const sr = 48000, hz = 880, samples = new Float32Array(8192);
+            for (let i = 0; i < samples.length; i++) samples[i] = 0.7 * Math.sin(2 * Math.PI * hz * i / sr);
+            const frequency = detectPitchYin(samples, sr, { minHz: 65, maxHz: 1000 });
+            return {
+              frequency,
+              guidance: vocalGuidance(220, 261.625565),
+              centered: vocalGuidance(440, 440),
+            };
+          }
+        """)
+        assert abs(vocal["frequency"] - 880) < 1.0, vocal
+        assert vocal["guidance"]["direction"] == "suba", vocal
+        assert vocal["guidance"]["semitones"] == 3, vocal
+        assert vocal["centered"]["inTune"] is True, vocal
         detected = page.evaluate("""
           () => {
             const sr = 48000, hz = 110, n = 8192;
@@ -75,10 +94,34 @@ def main() -> int:
         page.locator("#btnTuner").click()
         page.wait_for_function("document.querySelector('#tunerStatus').textContent.includes('ouvindo')", timeout=10_000)
         assert page.locator("#tunerPanel").evaluate("el => el.open")
+        page.locator("#voiceMode").click()
+        assert page.locator("#voiceControls").is_visible()
+        assert page.locator("#tunerTitle").inner_text() == "TREINO VOCAL · MICROFONE"
+        page.locator("#voiceTarget").select_option("60")
+        assert abs(page.evaluate("voiceTargetFrequency()") - 261.625565) < 0.01
+        page.locator("#voiceTarget").select_option("57")
+        page.evaluate("voiceHoldSeconds = 0; for (let i = 0; i < 35; i++) updateTunerDisplay(220)")
+        assert page.evaluate("voiceHoldSeconds") >= 3
+        assert "Nota sustentada" in page.locator("#voiceGuidance").inner_text()
+        page.locator("#btnReference").click()
+        assert page.locator("#btnReference").is_disabled()
+        assert page.evaluate("referencePlaying") is True
+        page.wait_for_function("!document.querySelector('#btnReference').disabled", timeout=3_000)
+        assert page.evaluate("referencePlaying") is False
+        page.locator("#guitarMode").click()
+        assert not page.locator("#voiceControls").is_visible()
         page.locator("#btnTunerStop").click()
         assert page.locator("#tunerStatus").inner_text() == "microfone desligado"
         page.locator(".tuner-close").click()
         assert not page.locator("#tunerPanel").evaluate("el => el.open")
+
+        if "--tuner-only" in sys.argv:
+            http_errors = [r for r in responses if r["status"] >= 400]
+            assert not http_errors, http_errors
+            assert not console_errors, console_errors
+            print("PASS tuner-only: guitar + voice + microphone lifecycle + reference anti-echo")
+            browser.close()
+            return 0
 
         # Connect if needed.
         if page.locator("#conn").inner_text() != "conectado":

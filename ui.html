@@ -295,6 +295,17 @@
   .tuner-guide { display:flex; justify-content:space-between; color:var(--muted); font-size:.72rem; margin:0 17px 18px; }
   .tuner-actions { display:flex; justify-content:center; gap:10px; }
   .tuner-tip { color:var(--muted); font-size:.74rem; line-height:1.45; margin:16px auto 0; max-width:440px; }
+  .tuner-modes { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:16px 0 4px; }
+  .tuner-modes button.active { color:var(--accent); border-color:var(--accent); background:var(--accent-dim); }
+  .voice-controls { margin:14px 0 2px; padding:13px; border:1px solid var(--line); border-radius:13px; background:rgba(255,255,255,.018); }
+  .voice-target-row { display:flex; align-items:center; justify-content:center; gap:9px; flex-wrap:wrap; }
+  .voice-target-row label { color:var(--muted); font-size:.78rem; }
+  .voice-target-row select { font:inherit; color:var(--text); background:var(--panel2); border:1px solid var(--line); border-radius:9px; padding:7px 10px; }
+  .voice-guidance { min-height:1.5em; margin-top:10px; font-weight:650; }
+  .voice-hold-label { color:var(--muted); font-size:.72rem; margin:9px 0 5px; }
+  .voice-hold { height:7px; overflow:hidden; border-radius:999px; background:var(--bg); }
+  .voice-hold > div { width:0%; height:100%; background:var(--ok); transition:width .1s linear; }
+  .voice-trace { width:100%; height:82px; margin-top:10px; display:block; border-radius:9px; background:#0b0e14; }
 </style>
 </head>
 <body>
@@ -396,6 +407,21 @@
       <div><h2 id="tunerTitle">AFINADOR · MICROFONE</h2><div class="tuner-status" id="tunerStatus">microfone desligado</div></div>
       <button class="tuner-close" onclick="closeTuner()" aria-label="Fechar afinador">×</button>
     </div>
+    <div class="tuner-modes">
+      <button id="guitarMode" class="active" onclick="setTunerMode('guitar')">Guitarra</button>
+      <button id="voiceMode" onclick="setTunerMode('voice')">Voz · treino de nota</button>
+    </div>
+    <div class="voice-controls" id="voiceControls" hidden>
+      <div class="voice-target-row">
+        <label for="voiceTarget">Nota-alvo</label>
+        <select id="voiceTarget" onchange="changeVoiceTarget()"></select>
+        <button id="btnReference" onclick="playVoiceReference()">▶ Ouvir nota</button>
+      </div>
+      <div class="voice-guidance" id="voiceGuidance">Escolha uma nota e cante</div>
+      <div class="voice-hold-label" id="voiceHoldLabel">sustente afinado por 3 segundos · 0,0 s</div>
+      <div class="voice-hold"><div id="voiceHoldBar"></div></div>
+      <canvas class="voice-trace" id="voiceTrace" width="480" height="82" aria-label="Histórico da estabilidade vocal"></canvas>
+    </div>
     <div class="tuner-note" id="tunerNote">—</div>
     <div class="tuner-hz" id="tunerHz">toque uma corda</div>
     <div class="tuner-meter" aria-label="Desvio da afinação">
@@ -407,7 +433,7 @@
       <button class="primary" id="btnTunerStart" onclick="startTuner()">Ligar microfone</button>
       <button id="btnTunerStop" onclick="stopTuner()" disabled>Desligar</button>
     </div>
-    <div class="tuner-tip">Use o canal clean, volume moderado e toque uma corda por vez. Abafe as outras cordas. O áudio é processado somente neste navegador.</div>
+    <div class="tuner-tip" id="tunerTip">Use o canal clean, volume moderado e toque uma corda por vez. Abafe as outras cordas. O áudio é processado somente neste navegador.</div>
   </div>
 </dialog>
 
@@ -435,8 +461,13 @@ let tunerAnalyser = null;
 let tunerFrame = 0;
 let tunerLastSample = 0;
 let tunerHistory = [];
+let tunerMode = 'guitar';
+let voiceHoldSeconds = 0;
+let voiceTracePoints = [];
+let referencePlaying = false;
+const SOLFEGE = ['Dó','Dó♯','Ré','Mi♭','Mi','Fá','Fá♯','Sol','Lá♭','Lá','Si♭','Si'];
 
-function detectPitchYin(samples, sampleRate) {
+function detectPitchYin(samples, sampleRate, range = {}) {
   if (!samples || samples.length < 1024 || !Number.isFinite(sampleRate)) return null;
   const windowSize = Math.min(4096, samples.length);
   const start = samples.length - windowSize;
@@ -444,7 +475,8 @@ function detectPitchYin(samples, sampleRate) {
   for (let i = 0; i < windowSize; i++) energy += samples[start + i] * samples[start + i];
   if (Math.sqrt(energy / windowSize) < 0.008) return null;
 
-  const minHz = 55, maxHz = 500;
+  const minHz = Number(range.minHz) || 55;
+  const maxHz = Number(range.maxHz) || 500;
   const minTau = Math.max(2, Math.floor(sampleRate / maxHz));
   const maxTau = Math.min(Math.floor(sampleRate / minHz), windowSize - 2);
   const compareLength = windowSize - maxTau;
@@ -497,6 +529,71 @@ function pitchInfo(frequency) {
   };
 }
 
+function vocalGuidance(currentFrequency, targetFrequency) {
+  if (!Number.isFinite(currentFrequency) || !Number.isFinite(targetFrequency) || currentFrequency <= 0 || targetFrequency <= 0) return null;
+  const cents = Math.round(1200 * Math.log2(currentFrequency / targetFrequency));
+  const absolute = Math.abs(cents);
+  return {
+    cents,
+    inTune: absolute <= 10,
+    direction: absolute <= 10 ? 'sustente' : cents < 0 ? 'suba' : 'desça',
+    semitones: Math.round(absolute / 100),
+  };
+}
+
+function voiceTargetFrequency() {
+  const midi = Number(document.getElementById('voiceTarget').value || 57);
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+function drawVoiceTrace() {
+  const canvas = document.getElementById('voiceTrace');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height, mid = h / 2;
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = '#263044'; ctx.lineWidth = 1;
+  for (const cents of [-100, 0, 100]) {
+    const y = mid - cents / 200 * (mid - 8);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  if (voiceTracePoints.length < 2) return;
+  ctx.strokeStyle = '#3dd6ff'; ctx.lineWidth = 2; ctx.beginPath();
+  voiceTracePoints.forEach((point, i) => {
+    const x = i * w / Math.max(1, voiceTracePoints.length - 1);
+    const y = mid - Math.max(-200, Math.min(200, point)) / 200 * (mid - 8);
+    if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function updateVoiceFeedback(frequency) {
+  const guidanceEl = document.getElementById('voiceGuidance');
+  const holdBar = document.getElementById('voiceHoldBar');
+  const holdLabel = document.getElementById('voiceHoldLabel');
+  if (!frequency) {
+    voiceHoldSeconds = 0;
+    guidanceEl.textContent = 'Cante a nota-alvo';
+    holdBar.style.width = '0%';
+    holdLabel.textContent = 'sustente afinado por 3 segundos · 0,0 s';
+    return null;
+  }
+  const guide = vocalGuidance(frequency, voiceTargetFrequency());
+  if (guide.inTune) {
+    voiceHoldSeconds = Math.min(3, voiceHoldSeconds + 0.09);
+    guidanceEl.textContent = voiceHoldSeconds >= 3 ? '✓ Nota sustentada!' : 'No alvo — sustente';
+  } else {
+    voiceHoldSeconds = Math.max(0, voiceHoldSeconds - 0.18);
+    if (Math.abs(guide.cents) < 50) guidanceEl.textContent = `${guide.direction} um pouco · ${Math.abs(guide.cents)} cents`;
+    else guidanceEl.textContent = `${guide.direction} ${Math.max(1, guide.semitones)} semitom${guide.semitones === 1 ? '' : 's'}`;
+  }
+  holdBar.style.width = `${voiceHoldSeconds / 3 * 100}%`;
+  holdLabel.textContent = `sustente afinado por 3 segundos · ${voiceHoldSeconds.toFixed(1).replace('.', ',')} s`;
+  voiceTracePoints.push(guide.cents);
+  if (voiceTracePoints.length > 55) voiceTracePoints.shift();
+  drawVoiceTrace();
+  return guide;
+}
+
 function updateTunerDisplay(frequency) {
   const noteEl = document.getElementById('tunerNote');
   const hzEl = document.getElementById('tunerHz');
@@ -505,26 +602,31 @@ function updateTunerDisplay(frequency) {
   const info = pitchInfo(frequency);
   if (!info) {
     noteEl.textContent = '—'; noteEl.classList.remove('in-tune');
-    hzEl.textContent = 'toque uma corda'; centsEl.textContent = '— cents';
-    needle.style.transform = 'rotate(0deg)';
+    hzEl.textContent = tunerMode === 'voice' ? 'cante a nota-alvo' : 'toque uma corda';
+    centsEl.textContent = '— cents'; needle.style.transform = 'rotate(0deg)';
+    if (tunerMode === 'voice') updateVoiceFeedback(null);
     return;
   }
-  const cents = Math.max(-50, Math.min(50, info.cents));
+  const guide = tunerMode === 'voice' ? updateVoiceFeedback(frequency) : null;
+  const rawCents = guide ? guide.cents : info.cents;
+  const cents = Math.max(-50, Math.min(50, rawCents));
+  const inTune = guide ? guide.inTune : Math.abs(info.cents) <= 5;
   noteEl.textContent = info.note;
-  noteEl.classList.toggle('in-tune', Math.abs(info.cents) <= 5);
+  noteEl.classList.toggle('in-tune', inTune);
   hzEl.textContent = `${frequency.toFixed(1)} Hz`;
-  centsEl.textContent = Math.abs(info.cents) <= 2 ? 'afinado' : `${info.cents > 0 ? '+' : ''}${info.cents} cents`;
+  centsEl.textContent = inTune ? 'afinado' : `${rawCents > 0 ? '+' : ''}${rawCents} cents do alvo`;
   needle.style.transform = `rotate(${cents * 0.75}deg)`;
-  needle.style.background = Math.abs(info.cents) <= 5 ? 'var(--ok)' : 'var(--accent)';
+  needle.style.background = inTune ? 'var(--ok)' : 'var(--accent)';
 }
 
 function tunerLoop(now) {
   if (!tunerAnalyser) return;
-  if (now - tunerLastSample >= 90) {
+  if (now - tunerLastSample >= 90 && !referencePlaying) {
     tunerLastSample = now;
     const samples = new Float32Array(tunerAnalyser.fftSize);
     tunerAnalyser.getFloatTimeDomainData(samples);
-    const frequency = detectPitchYin(samples, tunerContext.sampleRate);
+    const range = tunerMode === 'voice' ? { minHz: 65, maxHz: 1000 } : { minHz: 55, maxHz: 500 };
+    const frequency = detectPitchYin(samples, tunerContext.sampleRate, range);
     if (frequency) {
       tunerHistory.push(frequency);
       if (tunerHistory.length > 5) tunerHistory.shift();
@@ -537,6 +639,64 @@ function tunerLoop(now) {
   }
   tunerFrame = requestAnimationFrame(tunerLoop);
 }
+
+function populateVoiceTargets() {
+  const select = document.getElementById('voiceTarget');
+  let html = '';
+  for (let midi = 36; midi <= 83; midi++) {
+    const index = (midi % 12 + 12) % 12;
+    const scientific = `${NOTE[index]}${Math.floor(midi / 12) - 1}`;
+    html += `<option value="${midi}"${midi === 57 ? ' selected' : ''}>${scientific} · ${SOLFEGE[index]}</option>`;
+  }
+  select.innerHTML = html;
+}
+
+function setTunerMode(mode) {
+  tunerMode = mode === 'voice' ? 'voice' : 'guitar';
+  document.getElementById('guitarMode').classList.toggle('active', tunerMode === 'guitar');
+  document.getElementById('voiceMode').classList.toggle('active', tunerMode === 'voice');
+  document.getElementById('voiceControls').hidden = tunerMode !== 'voice';
+  document.getElementById('tunerTitle').textContent = tunerMode === 'voice' ? 'TREINO VOCAL · MICROFONE' : 'AFINADOR · MICROFONE';
+  document.getElementById('tunerTip').textContent = tunerMode === 'voice'
+    ? 'Ouça a referência, cante em uma vogal confortável (como “ah”) e ajuste sem forçar a garganta. O áudio fica somente neste navegador.'
+    : 'Use o canal clean, volume moderado e toque uma corda por vez. Abafe as outras cordas. O áudio é processado somente neste navegador.';
+  tunerHistory = []; voiceHoldSeconds = 0; voiceTracePoints = [];
+  drawVoiceTrace(); updateTunerDisplay(null);
+  if (tunerStream) document.getElementById('tunerStatus').textContent = tunerMode === 'voice'
+    ? 'ouvindo o microfone · cante a nota-alvo' : 'ouvindo o microfone · toque uma corda';
+}
+
+function changeVoiceTarget() {
+  voiceHoldSeconds = 0; voiceTracePoints = [];
+  drawVoiceTrace(); updateTunerDisplay(null);
+}
+
+async function playVoiceReference() {
+  const button = document.getElementById('btnReference');
+  button.disabled = true;
+  referencePlaying = true;
+  try {
+    const context = new (window.AudioContext || window.webkitAudioContext)();
+    await context.resume();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = 'sine'; oscillator.frequency.value = voiceTargetFrequency();
+    gain.gain.setValueAtTime(0.0001, context.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.045, context.currentTime + 0.04);
+    gain.gain.setValueAtTime(0.045, context.currentTime + 0.75);
+    gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 1.15);
+    oscillator.connect(gain).connect(context.destination);
+    oscillator.start(); oscillator.stop(context.currentTime + 1.2);
+    oscillator.onended = () => { referencePlaying = false; context.close().catch(() => {}); button.disabled = false; };
+  } catch (e) {
+    referencePlaying = false;
+    button.disabled = false;
+    document.getElementById('tunerStatus').textContent = `não foi possível tocar a referência: ${e.message || e}`;
+  }
+}
+
+populateVoiceTargets();
+drawVoiceTrace();
 
 async function startTuner() {
   if (tunerStream) return;
@@ -555,7 +715,7 @@ async function startTuner() {
     tunerAnalyser = tunerContext.createAnalyser(); tunerAnalyser.fftSize = 8192; tunerAnalyser.smoothingTimeConstant = 0;
     source.connect(highpass).connect(lowpass).connect(tunerAnalyser);
     tunerHistory = []; tunerLastSample = 0;
-    status.textContent = 'ouvindo o microfone · toque uma corda';
+    status.textContent = tunerMode === 'voice' ? 'ouvindo o microfone · cante a nota-alvo' : 'ouvindo o microfone · toque uma corda';
     document.getElementById('btnTunerStart').disabled = true;
     document.getElementById('btnTunerStop').disabled = false;
     tunerFrame = requestAnimationFrame(tunerLoop);
