@@ -90,6 +90,19 @@ preset invalidates its prepared hash; run **Preparar Live** again. Unprepared or
 stale presets automatically fall back to the regular loader. Preparation uses a
 volume cap of 50 and the UI reports that effective volume.
 
+## Microphone guitar tuner
+
+Click **Afinador** in the top bar and allow microphone access. The browser reads
+the notebook's default input through Web Audio, detects approximately 55–500 Hz
+with a YIN pitch detector, and shows note, frequency, cents and a visual needle.
+This covers Drop D (`D2`, 73.42 Hz) through the high guitar strings. Use a clean
+amp tone at moderate volume, play one string at a time, and mute the others.
+
+Audio never leaves the browser and is not sent to the FastAPI backend. Closing
+the tuner or clicking **Desligar** stops the media tracks and releases the
+microphone. Chrome treats `http://127.0.0.1` as a secure local context for
+microphone permission.
+
 ## UI stress tests
 
 The browser test launches headless Chrome, rapidly switches presets and adjusts

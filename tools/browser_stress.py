@@ -31,7 +31,10 @@ def main() -> int:
         browser = p.chromium.launch(
             headless=True,
             executable_path="/usr/bin/google-chrome",
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox", "--disable-dev-shm-usage",
+                "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream",
+            ],
         )
         page = browser.new_page(viewport={"width": 1600, "height": 900})
 
@@ -44,7 +47,38 @@ def main() -> int:
         page.goto(BASE, wait_until="networkidle", timeout=15_000)
         page.wait_for_selector(".card", timeout=10_000)
         page.wait_for_selector("#btnLive", timeout=2_000)
+        page.wait_for_selector("#btnTuner", timeout=2_000)
         assert page.evaluate("typeof prepareLive === 'function' && liveSlots instanceof Map")
+        detected = page.evaluate("""
+          () => {
+            const sr = 48000, hz = 110, n = 8192;
+            const samples = new Float32Array(n);
+            for (let i = 0; i < n; i++) samples[i] = 0.8 * Math.sin(2 * Math.PI * hz * i / sr);
+            const frequency = detectPitchYin(samples, sr);
+            return { frequency, info: pitchInfo(frequency) };
+          }
+        """)
+        assert abs(detected["frequency"] - 110) < 0.5, detected
+        assert detected["info"]["note"] == "A2", detected
+        assert abs(detected["info"]["cents"]) <= 2, detected
+        guitar_notes = page.evaluate("""
+          () => [73.42, 82.41, 329.63].map(hz => {
+            const sr = 48000, samples = new Float32Array(8192);
+            for (let i = 0; i < samples.length; i++) samples[i] = 0.7 * Math.sin(2 * Math.PI * hz * i / sr);
+            const frequency = detectPitchYin(samples, sr);
+            return pitchInfo(frequency).note;
+          })
+        """)
+        assert guitar_notes == ["D2", "E2", "E4"], guitar_notes
+        assert page.evaluate("detectPitchYin(new Float32Array(4096), 48000)") is None
+
+        page.locator("#btnTuner").click()
+        page.wait_for_function("document.querySelector('#tunerStatus').textContent.includes('ouvindo')", timeout=10_000)
+        assert page.locator("#tunerPanel").evaluate("el => el.open")
+        page.locator("#btnTunerStop").click()
+        assert page.locator("#tunerStatus").inner_text() == "microfone desligado"
+        page.locator(".tuner-close").click()
+        assert not page.locator("#tunerPanel").evaluate("el => el.open")
 
         # Connect if needed.
         if page.locator("#conn").inner_text() != "conectado":

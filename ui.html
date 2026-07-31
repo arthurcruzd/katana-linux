@@ -268,6 +268,33 @@
   /* focus ring for keyboard nav on cards */
   .card:focus { outline: none; }
   .card:focus-visible { border-color: var(--accent); }
+
+  /* microphone guitar tuner */
+  dialog.tuner-dialog {
+    width: min(560px, calc(100vw - 32px));
+    color: var(--text); background: #10141d;
+    border: 1px solid #354057; border-radius: 20px;
+    padding: 0; box-shadow: 0 28px 90px rgba(0,0,0,.7);
+  }
+  dialog.tuner-dialog::backdrop { background: rgba(3,5,9,.78); backdrop-filter: blur(5px); }
+  .tuner { padding: 22px 24px 20px; text-align: center; }
+  .tuner-head { display:flex; align-items:center; justify-content:space-between; text-align:left; }
+  .tuner-head h2 { margin:0; font-size:1rem; letter-spacing:.06em; }
+  .tuner-close { padding:5px 10px; font-size:1.15rem; }
+  .tuner-status { color:var(--muted); font-size:.78rem; min-height:1.2em; margin-top:5px; }
+  .tuner-note { font-size:5.2rem; font-weight:750; line-height:1; margin:22px 0 3px; letter-spacing:-.06em; }
+  .tuner-note.in-tune { color:var(--ok); text-shadow:0 0 28px rgba(61,214,140,.28); }
+  .tuner-hz { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .tuner-meter { position:relative; height:74px; margin:22px 18px 4px; overflow:hidden; }
+  .tuner-scale { position:absolute; left:0; right:0; bottom:8px; height:2px; background:var(--line); }
+  .tuner-scale::before, .tuner-scale::after { content:""; position:absolute; top:-5px; width:1px; height:12px; background:#59647a; }
+  .tuner-scale::before { left:25%; } .tuner-scale::after { right:25%; }
+  .tuner-center { position:absolute; left:50%; bottom:2px; width:2px; height:22px; background:var(--ok); transform:translateX(-1px); }
+  .tuner-needle { position:absolute; left:50%; bottom:9px; width:3px; height:58px; border-radius:3px; background:var(--accent); transform-origin:50% 100%; transform:rotate(0deg); transition:transform .1s linear, background .1s; }
+  .tuner-cents { font-size:1.05rem; font-variant-numeric:tabular-nums; min-height:1.4em; }
+  .tuner-guide { display:flex; justify-content:space-between; color:var(--muted); font-size:.72rem; margin:0 17px 18px; }
+  .tuner-actions { display:flex; justify-content:center; gap:10px; }
+  .tuner-tip { color:var(--muted); font-size:.74rem; line-height:1.45; margin:16px auto 0; max-width:440px; }
 </style>
 </head>
 <body>
@@ -281,6 +308,7 @@
       <div class="badge"><span class="dot" id="dot"></span><span id="conn">…</span></div>
       <button class="primary" id="btnConnect" onclick="connect()">Conectar</button>
       <button id="btnLive" onclick="prepareLive()">Preparar Live</button>
+      <button id="btnTuner" onclick="openTuner()">Afinador</button>
       <button onclick="refresh()">Atualizar</button>
     </div>
   </header>
@@ -362,6 +390,27 @@
   </footer>
 </div>
 
+<dialog class="tuner-dialog" id="tunerPanel" aria-labelledby="tunerTitle">
+  <div class="tuner">
+    <div class="tuner-head">
+      <div><h2 id="tunerTitle">AFINADOR · MICROFONE</h2><div class="tuner-status" id="tunerStatus">microfone desligado</div></div>
+      <button class="tuner-close" onclick="closeTuner()" aria-label="Fechar afinador">×</button>
+    </div>
+    <div class="tuner-note" id="tunerNote">—</div>
+    <div class="tuner-hz" id="tunerHz">toque uma corda</div>
+    <div class="tuner-meter" aria-label="Desvio da afinação">
+      <div class="tuner-scale"></div><div class="tuner-center"></div><div class="tuner-needle" id="tunerNeedle"></div>
+    </div>
+    <div class="tuner-guide"><span>♭ baixo</span><span>afinado</span><span>♯ alto</span></div>
+    <div class="tuner-cents" id="tunerCents">— cents</div>
+    <div class="tuner-actions">
+      <button class="primary" id="btnTunerStart" onclick="startTuner()">Ligar microfone</button>
+      <button id="btnTunerStop" onclick="stopTuner()" disabled>Desligar</button>
+    </div>
+    <div class="tuner-tip">Use o canal clean, volume moderado e toque uma corda por vez. Abafe as outras cordas. O áudio é processado somente neste navegador.</div>
+  </div>
+</dialog>
+
 <script>
 const NOTE = ['C','C#','D','Eb','E','F','F#','G','Ab','A','Bb','B'];
 const AMP_TYPES = ['acoustic','clean','pushed','crunch','lead','brown'];
@@ -380,6 +429,170 @@ let bleGen = 0;              // invalidates stale controls when preset changes
 let bleTail = Promise.resolve();
 let liveSlots = new Map();   // preset id -> internal slot 0..9
 let livePreparing = false;
+let tunerStream = null;
+let tunerContext = null;
+let tunerAnalyser = null;
+let tunerFrame = 0;
+let tunerLastSample = 0;
+let tunerHistory = [];
+
+function detectPitchYin(samples, sampleRate) {
+  if (!samples || samples.length < 1024 || !Number.isFinite(sampleRate)) return null;
+  const windowSize = Math.min(4096, samples.length);
+  const start = samples.length - windowSize;
+  let energy = 0;
+  for (let i = 0; i < windowSize; i++) energy += samples[start + i] * samples[start + i];
+  if (Math.sqrt(energy / windowSize) < 0.008) return null;
+
+  const minHz = 55, maxHz = 500;
+  const minTau = Math.max(2, Math.floor(sampleRate / maxHz));
+  const maxTau = Math.min(Math.floor(sampleRate / minHz), windowSize - 2);
+  const compareLength = windowSize - maxTau;
+  const yin = new Float32Array(maxTau + 1);
+  for (let tau = 1; tau <= maxTau; tau++) {
+    let sum = 0;
+    for (let i = 0; i < compareLength; i++) {
+      const delta = samples[start + i] - samples[start + i + tau];
+      sum += delta * delta;
+    }
+    yin[tau] = sum;
+  }
+  let running = 0;
+  yin[0] = 1;
+  for (let tau = 1; tau <= maxTau; tau++) {
+    running += yin[tau];
+    yin[tau] = running ? yin[tau] * tau / running : 1;
+  }
+
+  let tau = -1;
+  for (let t = minTau; t < maxTau; t++) {
+    if (yin[t] < 0.12) {
+      while (t + 1 <= maxTau && yin[t + 1] < yin[t]) t++;
+      tau = t;
+      break;
+    }
+  }
+  if (tau < 0) {
+    let best = minTau;
+    for (let t = minTau + 1; t <= maxTau; t++) if (yin[t] < yin[best]) best = t;
+    if (yin[best] > 0.25) return null;
+    tau = best;
+  }
+  const left = yin[Math.max(1, tau - 1)], center = yin[tau], right = yin[Math.min(maxTau, tau + 1)];
+  const denominator = 2 * (2 * center - right - left);
+  const refinedTau = tau + (denominator ? (right - left) / denominator : 0);
+  const frequency = sampleRate / refinedTau;
+  return frequency >= minHz && frequency <= maxHz ? frequency : null;
+}
+
+function pitchInfo(frequency) {
+  if (!Number.isFinite(frequency) || frequency <= 0) return null;
+  const midiFloat = 69 + 12 * Math.log2(frequency / 440);
+  const midi = Math.round(midiFloat);
+  const reference = 440 * Math.pow(2, (midi - 69) / 12);
+  return {
+    note: `${NOTE[(midi % 12 + 12) % 12]}${Math.floor(midi / 12) - 1}`,
+    cents: Math.round(1200 * Math.log2(frequency / reference)),
+    reference,
+  };
+}
+
+function updateTunerDisplay(frequency) {
+  const noteEl = document.getElementById('tunerNote');
+  const hzEl = document.getElementById('tunerHz');
+  const centsEl = document.getElementById('tunerCents');
+  const needle = document.getElementById('tunerNeedle');
+  const info = pitchInfo(frequency);
+  if (!info) {
+    noteEl.textContent = '—'; noteEl.classList.remove('in-tune');
+    hzEl.textContent = 'toque uma corda'; centsEl.textContent = '— cents';
+    needle.style.transform = 'rotate(0deg)';
+    return;
+  }
+  const cents = Math.max(-50, Math.min(50, info.cents));
+  noteEl.textContent = info.note;
+  noteEl.classList.toggle('in-tune', Math.abs(info.cents) <= 5);
+  hzEl.textContent = `${frequency.toFixed(1)} Hz`;
+  centsEl.textContent = Math.abs(info.cents) <= 2 ? 'afinado' : `${info.cents > 0 ? '+' : ''}${info.cents} cents`;
+  needle.style.transform = `rotate(${cents * 0.75}deg)`;
+  needle.style.background = Math.abs(info.cents) <= 5 ? 'var(--ok)' : 'var(--accent)';
+}
+
+function tunerLoop(now) {
+  if (!tunerAnalyser) return;
+  if (now - tunerLastSample >= 90) {
+    tunerLastSample = now;
+    const samples = new Float32Array(tunerAnalyser.fftSize);
+    tunerAnalyser.getFloatTimeDomainData(samples);
+    const frequency = detectPitchYin(samples, tunerContext.sampleRate);
+    if (frequency) {
+      tunerHistory.push(frequency);
+      if (tunerHistory.length > 5) tunerHistory.shift();
+      const sorted = [...tunerHistory].sort((a,b) => a-b);
+      updateTunerDisplay(sorted[Math.floor(sorted.length / 2)]);
+    } else {
+      tunerHistory = [];
+      updateTunerDisplay(null);
+    }
+  }
+  tunerFrame = requestAnimationFrame(tunerLoop);
+}
+
+async function startTuner() {
+  if (tunerStream) return;
+  const status = document.getElementById('tunerStatus');
+  status.textContent = 'solicitando acesso ao microfone…';
+  try {
+    tunerStream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+      channelCount: 1,
+    }});
+    tunerContext = new (window.AudioContext || window.webkitAudioContext)();
+    await tunerContext.resume();
+    const source = tunerContext.createMediaStreamSource(tunerStream);
+    const highpass = tunerContext.createBiquadFilter(); highpass.type = 'highpass'; highpass.frequency.value = 45;
+    const lowpass = tunerContext.createBiquadFilter(); lowpass.type = 'lowpass'; lowpass.frequency.value = 1200;
+    tunerAnalyser = tunerContext.createAnalyser(); tunerAnalyser.fftSize = 8192; tunerAnalyser.smoothingTimeConstant = 0;
+    source.connect(highpass).connect(lowpass).connect(tunerAnalyser);
+    tunerHistory = []; tunerLastSample = 0;
+    status.textContent = 'ouvindo o microfone · toque uma corda';
+    document.getElementById('btnTunerStart').disabled = true;
+    document.getElementById('btnTunerStop').disabled = false;
+    tunerFrame = requestAnimationFrame(tunerLoop);
+  } catch (e) {
+    tunerStream = null;
+    status.textContent = e && e.name === 'NotAllowedError'
+      ? 'acesso negado · permita o microfone no navegador'
+      : `não foi possível abrir o microfone: ${e.message || e}`;
+  }
+}
+
+function stopTuner() {
+  cancelAnimationFrame(tunerFrame); tunerFrame = 0;
+  if (tunerStream) tunerStream.getTracks().forEach(track => track.stop());
+  tunerStream = null; tunerAnalyser = null; tunerHistory = [];
+  if (tunerContext) tunerContext.close().catch(() => {});
+  tunerContext = null;
+  updateTunerDisplay(null);
+  document.getElementById('tunerStatus').textContent = 'microfone desligado';
+  document.getElementById('btnTunerStart').disabled = false;
+  document.getElementById('btnTunerStop').disabled = true;
+}
+
+function openTuner() {
+  const panel = document.getElementById('tunerPanel');
+  if (!panel.open) panel.showModal();
+  startTuner();
+}
+
+function closeTuner() {
+  stopTuner();
+  document.getElementById('tunerPanel').close();
+}
+
+document.getElementById('tunerPanel').addEventListener('cancel', (event) => {
+  event.preventDefault(); closeTuner();
+});
 
 function bleEnqueue(fn) {
   const p = bleTail.then(fn, fn);
